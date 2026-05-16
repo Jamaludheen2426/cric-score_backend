@@ -141,36 +141,45 @@ export async function addBall(matchId: number, input: BallInput) {
     });
   }
 
-  // Auto-close innings if all out (no new batsman means no more pairs)
+  // Rotate strike on odd runs (non-wide, non-wicket)
+  if (!input.is_wide && !input.is_wicket && input.runs % 2 === 1) {
+    await innings.reload();
+    const newOnStrike = innings.on_strike_batsman_id === innings.current_batsman1_id
+      ? innings.current_batsman2_id!
+      : innings.current_batsman1_id!;
+    await innings.update({ on_strike_batsman_id: newOnStrike });
+  }
+
+  // Refresh innings + overs count
   await innings.reload();
+  await recalcInningsOvers(innings.id, innings);
+  await innings.reload();
+
+  // ── End-of-innings / end-of-match checks ──────────────────────
   const allOut = input.is_wicket && !input.new_batsman_id && innings.total_wickets >= match.players_per_side - 1;
-  if (allOut) {
+  const oversFinished = Number(innings.total_overs_bowled) >= match.total_overs;
+  const targetReached = innings.innings_number === 2 && innings.target != null && innings.total_runs >= innings.target;
+
+  if (allOut || oversFinished || targetReached) {
     await innings.update({ status: 'completed' });
     await over.update({ status: 'completed' });
-    await recalcInningsOvers(innings.id, innings);
+
+    // If this is the 2nd innings, the match is over
+    if (innings.innings_number === 2) {
+      await match.update({ status: 'completed' });
+    }
+
     const liveScore = await getLiveScore(match.share_token);
     broadcastToMatch(match.share_token, liveScore);
-    return { ball, innings: await innings.reload(), allOut: true };
+    return {
+      ball,
+      innings: await innings.reload(),
+      allOut,
+      oversFinished,
+      targetReached,
+      matchEnded: innings.innings_number === 2,
+    };
   }
-
-  // Rotate strike on odd runs (non-wide)
-  let newOnStrike = innings.on_strike_batsman_id;
-  if (!input.is_wide && !input.is_wicket) {
-    if (input.runs % 2 === 1) {
-      // Swap striker
-      newOnStrike = innings.on_strike_batsman_id === innings.current_batsman1_id
-        ? innings.current_batsman2_id!
-        : innings.current_batsman1_id!;
-      await innings.reload();
-      await innings.update({ on_strike_batsman_id: newOnStrike });
-    }
-  }
-
-  // Refresh innings
-  await innings.reload();
-
-  // Recalculate total_overs_bowled from all overs
-  await recalcInningsOvers(innings.id, innings);
 
   // Broadcast via SSE
   const liveScore = await getLiveScore(match.share_token);
