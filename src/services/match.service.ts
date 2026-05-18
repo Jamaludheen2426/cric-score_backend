@@ -1,6 +1,14 @@
 import { v4 as uuidv4 } from 'uuid';
 import { Match, MatchSession, Team, Innings, Player } from '../models';
 
+async function requirePlayersOnTeam(teamId: number, playerIds: number[], label: string) {
+  const uniqueIds = [...new Set(playerIds)];
+  const count = await Player.count({ where: { id: uniqueIds, team_id: teamId } });
+  if (count !== uniqueIds.length) {
+    throw new Error(`${label} must belong to the selected team`);
+  }
+}
+
 export async function getAllMatches() {
   return Match.findAll({
     include: [
@@ -59,6 +67,12 @@ export async function startMatch(matchId: number, data: {
   const match = await Match.findByPk(matchId);
   if (!match) throw new Error('Match not found');
   if (match.status !== 'pending') throw new Error('Match already started');
+  if (![match.team_a_id, match.team_b_id].includes(data.toss_winner_team_id)) {
+    throw new Error('Toss winner must be one of the match teams');
+  }
+  if (data.opening_batsman1_id === data.opening_batsman2_id) {
+    throw new Error('Opening batsmen must be different players');
+  }
 
   // Determine batting/bowling teams
   const batting_team_id = data.elected_to === 'bat'
@@ -66,6 +80,9 @@ export async function startMatch(matchId: number, data: {
     : (data.toss_winner_team_id === match.team_a_id ? match.team_b_id : match.team_a_id);
 
   const bowling_team_id = batting_team_id === match.team_a_id ? match.team_b_id : match.team_a_id;
+
+  await requirePlayersOnTeam(batting_team_id, [data.opening_batsman1_id, data.opening_batsman2_id], 'Opening batsmen');
+  await requirePlayersOnTeam(bowling_team_id, [data.opening_bowler_id], 'Opening bowler');
 
   await match.update({ status: 'live', toss_winner_team_id: data.toss_winner_team_id, elected_to: data.elected_to });
 

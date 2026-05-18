@@ -49,6 +49,10 @@ BattingCard.init(
     sequelize,
     tableName: 'batting_cards',
     timestamps: false,
+    indexes: [
+      { fields: ['innings_id'] },
+      { fields: ['player_id'] },
+    ],
   }
 );
 

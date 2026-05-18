@@ -58,6 +58,12 @@ Match.init(
     sequelize,
     tableName: 'matches',
     timestamps: false,
+    indexes: [
+      { fields: ['team_a_id'] },
+      { fields: ['team_b_id'] },
+      { fields: ['share_token'] },
+      { fields: ['status'] },
+    ],
   }
 );
 

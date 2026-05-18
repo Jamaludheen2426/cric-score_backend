@@ -92,6 +92,8 @@ export async function getLiveScore(shareToken: string) {
   // Run rate calculations
   let runRate = 0;
   let requiredRate: number | null = null;
+  let runsNeeded: number | null = null;
+  let ballsLeft: number | null = null;
 
   if (currentInnings) {
     const oversFloat = currentInnings.total_overs_bowled;
@@ -101,10 +103,10 @@ export async function getLiveScore(shareToken: string) {
     runRate = totalBalls > 0 ? (currentInnings.total_runs / totalBalls) * 6 : 0;
 
     if (currentInnings.target && currentInnings.innings_number === 2) {
-      const runsNeeded = currentInnings.target - currentInnings.total_runs;
+      runsNeeded = Math.max(0, currentInnings.target - currentInnings.total_runs);
       const totalMatchBalls = match.total_overs * 6;
       const ballsUsed = totalBalls;
-      const ballsLeft = totalMatchBalls - ballsUsed;
+      ballsLeft = Math.max(0, totalMatchBalls - ballsUsed);
       requiredRate = ballsLeft > 0 ? (runsNeeded / ballsLeft) * 6 : 0;
     }
   }
@@ -147,6 +149,8 @@ export async function getLiveScore(shareToken: string) {
       bowlingCards: (inn as any).bowlingCards,
       run_rate: inn === currentInnings ? runRate : null,
       required_rate: inn === currentInnings ? requiredRate : null,
+      runs_needed: inn === currentInnings ? runsNeeded : null,
+      balls_left: inn === currentInnings ? ballsLeft : null,
     })),
     currentOver: currentOver ? {
       id: currentOver.id,

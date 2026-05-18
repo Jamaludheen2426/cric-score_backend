@@ -43,6 +43,10 @@ Over.init(
     sequelize,
     tableName: 'overs',
     timestamps: false,
+    indexes: [
+      { fields: ['innings_id'] },
+      { fields: ['bowler_player_id'] },
+    ],
   }
 );
 

@@ -40,6 +40,10 @@ BowlingCard.init(
     sequelize,
     tableName: 'bowling_cards',
     timestamps: false,
+    indexes: [
+      { fields: ['innings_id'] },
+      { fields: ['player_id'] },
+    ],
   }
 );
 

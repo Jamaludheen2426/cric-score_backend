@@ -61,6 +61,11 @@ Innings.init(
     sequelize,
     tableName: 'innings',
     timestamps: false,
+    indexes: [
+      { fields: ['match_id'] },
+      { fields: ['batting_team_id'] },
+      { fields: ['bowling_team_id'] },
+    ],
   }
 );
 

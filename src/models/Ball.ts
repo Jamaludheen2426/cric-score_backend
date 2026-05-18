@@ -52,6 +52,11 @@ Ball.init(
     sequelize,
     tableName: 'balls',
     timestamps: false,
+    indexes: [
+      { fields: ['over_id'] },
+      { fields: ['batsman_player_id'] },
+      { fields: ['dismissed_player_id'] },
+    ],
   }
 );
 

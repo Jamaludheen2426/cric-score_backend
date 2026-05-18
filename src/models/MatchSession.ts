@@ -31,6 +31,10 @@ MatchSession.init(
     sequelize,
     tableName: 'match_sessions',
     timestamps: false,
+    indexes: [
+      { fields: ['match_id'] },
+      { fields: ['token'] },
+    ],
   }
 );
 
