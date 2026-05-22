@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { sequelize } from './models';
 import teamRoutes from './routes/team.routes';
 import matchRoutes from './routes/match.routes';
+import tournamentRoutes from './routes/tournament.routes';
 
 dotenv.config();
 
@@ -23,6 +24,7 @@ app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: new Date().to
 // Routes
 app.use('/api/teams', teamRoutes);
 app.use('/api/matches', matchRoutes);
+app.use('/api/tournaments', tournamentRoutes);
 
 // 404
 app.use((_, res) => res.status(404).json({ success: false, error: 'Route not found' }));

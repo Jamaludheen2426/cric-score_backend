@@ -44,6 +44,14 @@ function wicketCounts(input: BallInput) {
   return WICKET_TYPES_ALLOWED_ON_NO_BALL.has(input.wicket_type || '');
 }
 
+function isDeathOver(match: Match, over: Over) {
+  return match.death_overs_from != null && over.over_number >= match.death_overs_from;
+}
+
+function wideGetsExtraRun(match: Match, over: Over) {
+  return match.wide_rule === 'strict' || isDeathOver(match, over);
+}
+
 export async function addBall(matchId: number, input: BallInput) {
   const match = await Match.findByPk(matchId);
   if (!match) throw new Error('Match not found');
@@ -89,9 +97,8 @@ export async function addBall(matchId: number, input: BallInput) {
   }
 
   const isLegal = !input.is_wide && !input.is_noball;
-  const inDeathOvers = match.death_overs_from != null && over.over_number >= match.death_overs_from;
   const ballExtras = (input.is_wide || input.is_noball)
-    ? (input.is_wide && inDeathOvers ? 2 : 1)
+    ? (input.is_wide ? (wideGetsExtraRun(match, over) ? 1 : 0) : 1)
     : 0;
   const batRuns = input.is_wide ? 0 : input.runs;
   const totalExtras = input.is_wide

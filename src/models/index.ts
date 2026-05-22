@@ -8,6 +8,8 @@ import Over from './Over';
 import Ball from './Ball';
 import BattingCard from './BattingCard';
 import BowlingCard from './BowlingCard';
+import Tournament from './Tournament';
+import TournamentTeam from './TournamentTeam';
 
 // Team → Players
 Team.hasMany(Player, { foreignKey: 'team_id', as: 'players' });
@@ -16,6 +18,14 @@ Player.belongsTo(Team, { foreignKey: 'team_id', as: 'team' });
 // Match → Teams
 Match.belongsTo(Team, { foreignKey: 'team_a_id', as: 'teamA' });
 Match.belongsTo(Team, { foreignKey: 'team_b_id', as: 'teamB' });
+Match.belongsTo(Tournament, { foreignKey: 'tournament_id', as: 'tournament' });
+Tournament.hasMany(Match, { foreignKey: 'tournament_id', as: 'matches' });
+
+// Tournament â†’ Teams
+Tournament.belongsToMany(Team, { through: TournamentTeam, foreignKey: 'tournament_id', otherKey: 'team_id', as: 'teams' });
+Team.belongsToMany(Tournament, { through: TournamentTeam, foreignKey: 'team_id', otherKey: 'tournament_id', as: 'tournaments' });
+TournamentTeam.belongsTo(Tournament, { foreignKey: 'tournament_id', as: 'tournament' });
+TournamentTeam.belongsTo(Team, { foreignKey: 'team_id', as: 'team' });
 
 // Match → Sessions
 Match.hasMany(MatchSession, { foreignKey: 'match_id', as: 'sessions' });
@@ -76,4 +86,6 @@ export {
   Ball,
   BattingCard,
   BowlingCard,
+  Tournament,
+  TournamentTeam,
 };

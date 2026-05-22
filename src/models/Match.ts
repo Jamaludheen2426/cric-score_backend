@@ -6,6 +6,7 @@ export interface MatchAttributes {
   title: string;
   team_a_id: number;
   team_b_id: number;
+  tournament_id?: number;
   total_overs: number;
   players_per_side: number;
   death_overs_from?: number;
@@ -25,6 +26,7 @@ class Match extends Model<MatchAttributes, MatchCreationAttributes> implements M
   public title!: string;
   public team_a_id!: number;
   public team_b_id!: number;
+  public tournament_id?: number;
   public total_overs!: number;
   public players_per_side!: number;
   public death_overs_from?: number;
@@ -43,6 +45,7 @@ Match.init(
     title: { type: DataTypes.STRING(200), allowNull: false },
     team_a_id: { type: DataTypes.INTEGER, allowNull: false, references: { model: 'teams', key: 'id' } },
     team_b_id: { type: DataTypes.INTEGER, allowNull: false, references: { model: 'teams', key: 'id' } },
+    tournament_id: { type: DataTypes.INTEGER, allowNull: true, references: { model: 'tournaments', key: 'id' } },
     total_overs: { type: DataTypes.INTEGER, allowNull: false },
     players_per_side: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 11 },
     death_overs_from: { type: DataTypes.INTEGER, allowNull: true },
@@ -61,6 +64,7 @@ Match.init(
     indexes: [
       { fields: ['team_a_id'] },
       { fields: ['team_b_id'] },
+      { fields: ['tournament_id'] },
       { fields: ['share_token'] },
       { fields: ['status'] },
     ],
