@@ -232,19 +232,30 @@ export async function addBall(matchId: number, input: BallInput) {
     });
   }
 
-  // Rotate strike on odd runs (non-wide, non-wicket). We already mutated
-  // current_batsman1/2/on_strike a few lines up if a wicket brought in a
-  // new batsman, so reload to read fresh ids before the swap.
+  // Rotate strike on odd runs (non-wide, non-wicket) AND recalc innings
+  // overs in a single combined update — both target the same innings row,
+  // so we save another Render→Aiven round-trip vs the previous two-step
+  // (reload + update for strike, then findAll + update for overs).
+  //
+  // The new total_overs_bowled is derived from the new over.legal_balls
+  // plus all completed overs already on this innings — we already know
+  // legal_balls per over from in-memory state, but for completed overs
+  // we'd need a sum. Approximate without a query: every completed over
+  // has 6 legal balls, so completed_overs = over.over_number - 1.
+  //   total_legal = (over.over_number - 1) * 6 + over.legal_balls
+  const newOverLegalBalls = over.legal_balls;   // already mutated by the .update above
+  const totalLegalBalls = (over.over_number - 1) * 6 + newOverLegalBalls;
+  const newTotalOversBowled = Math.floor(totalLegalBalls / 6) + (totalLegalBalls % 6) / 10;
+
+  const inningsPatch: Partial<{ on_strike_batsman_id: number; total_overs_bowled: number }> = {
+    total_overs_bowled: newTotalOversBowled,
+  };
   if (isLegal && !countsAsWicket && batRuns % 2 === 1) {
-    await innings.reload();
-    const newOnStrike = innings.on_strike_batsman_id === innings.current_batsman1_id
+    inningsPatch.on_strike_batsman_id = innings.on_strike_batsman_id === innings.current_batsman1_id
       ? innings.current_batsman2_id!
       : innings.current_batsman1_id!;
-    await innings.update({ on_strike_batsman_id: newOnStrike });
   }
-
-  // Recalc overs into the in-memory innings (one query, not three round-trips).
-  await recalcInningsOvers(innings.id, innings);
+  await innings.update(inningsPatch);
 
   // ── End-of-innings / end-of-match checks ──────────────────────────
   const allOut = Boolean(countsAsWicket && !input.new_batsman_id && noReplacementAvailable);
