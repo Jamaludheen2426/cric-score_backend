@@ -2,6 +2,29 @@
 import { broadcastToMatch } from '../middleware/sse';
 import { getLiveScore } from './live.service';
 
+/**
+ * Fire-and-forget SSE broadcast. We DON'T await this so the API request can
+ * return as soon as DB writes are persisted. The broadcast happens in the
+ * background and is delivered to connected SSE viewers a moment later.
+ *
+ * On a typical Render→Aiven setup, awaiting getLiveScore() adds ~1-3s of
+ * deep-include MySQL traffic per ball. With this helper, the user only
+ * waits for the actual stat writes (~5-10 queries) instead of also having
+ * to wait for the broadcast payload.
+ */
+function broadcastInBackground(shareToken: string) {
+  // Defer so the current handler can return immediately. Errors are logged
+  // but never thrown back to the caller.
+  setImmediate(async () => {
+    try {
+      const liveScore = await getLiveScore(shareToken);
+      broadcastToMatch(shareToken, liveScore);
+    } catch (err) {
+      console.error('[sse] background broadcast failed:', (err as Error)?.message);
+    }
+  });
+}
+
 async function getMaxBattersForInnings(match: Match, innings: Innings) {
   const rosterCount = await Player.count({ where: { team_id: innings.batting_team_id } });
   const configuredCount = Number(match.players_per_side) || rosterCount || 11;
@@ -14,8 +37,7 @@ async function completeInnings(match: Match, innings: Innings, over: Over) {
   if (innings.innings_number === 2) {
     await match.update({ status: 'completed' });
   }
-  const liveScore = await getLiveScore(match.share_token);
-  broadcastToMatch(match.share_token, liveScore);
+  broadcastInBackground(match.share_token);
 }
 async function recalcInningsOvers(inningsId: number, innings: Innings) {
   const allOvers = await Over.findAll({ where: { innings_id: inningsId } });
@@ -210,7 +232,9 @@ export async function addBall(matchId: number, input: BallInput) {
     });
   }
 
-  // Rotate strike on odd runs (non-wide, non-wicket)
+  // Rotate strike on odd runs (non-wide, non-wicket). We already mutated
+  // current_batsman1/2/on_strike a few lines up if a wicket brought in a
+  // new batsman, so reload to read fresh ids before the swap.
   if (isLegal && !countsAsWicket && batRuns % 2 === 1) {
     await innings.reload();
     const newOnStrike = innings.on_strike_batsman_id === innings.current_batsman1_id
@@ -219,12 +243,10 @@ export async function addBall(matchId: number, input: BallInput) {
     await innings.update({ on_strike_batsman_id: newOnStrike });
   }
 
-  // Refresh innings + overs count
-  await innings.reload();
+  // Recalc overs into the in-memory innings (one query, not three round-trips).
   await recalcInningsOvers(innings.id, innings);
-  await innings.reload();
 
-  // â”€â”€ End-of-innings / end-of-match checks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── End-of-innings / end-of-match checks ──────────────────────────
   const allOut = Boolean(countsAsWicket && !input.new_batsman_id && noReplacementAvailable);
   const oversFinished = Number(innings.total_overs_bowled) >= match.total_overs;
   const targetReached = innings.innings_number === 2 && innings.target != null && innings.total_runs >= innings.target;
@@ -233,7 +255,7 @@ export async function addBall(matchId: number, input: BallInput) {
     await completeInnings(match, innings, over);
     return {
       ball,
-      innings: await innings.reload(),
+      innings,
       allOut,
       oversFinished,
       targetReached,
@@ -241,11 +263,10 @@ export async function addBall(matchId: number, input: BallInput) {
     };
   }
 
-  // Broadcast via SSE
-  const liveScore = await getLiveScore(match.share_token);
-  broadcastToMatch(match.share_token, liveScore);
+  // Fire SSE broadcast in the background — the API can return now.
+  broadcastInBackground(match.share_token);
 
-  return { ball, innings: await innings.reload() };
+  return { ball, innings };
 }
 
 export async function endOver(matchId: number, nextBowlerId: number) {
@@ -297,9 +318,7 @@ export async function endOver(matchId: number, nextBowlerId: number) {
     await BowlingCard.create({ innings_id: innings.id, player_id: nextBowlerId });
   }
 
-  const liveScore = await getLiveScore(match.share_token);
-  broadcastToMatch(match.share_token, liveScore);
-
+  broadcastInBackground(match.share_token);
   return newOver;
 }
 
@@ -372,9 +391,7 @@ export async function endInnings(matchId: number, data: {
   await Over.create({ innings_id: newInnings.id, over_number: 1, bowler_player_id: data.opening_bowler_id });
   await BowlingCard.create({ innings_id: newInnings.id, player_id: data.opening_bowler_id });
 
-  const liveScore = await getLiveScore(match.share_token);
-  broadcastToMatch(match.share_token, liveScore);
-
+  broadcastInBackground(match.share_token);
   return newInnings;
 }
 
@@ -485,10 +502,8 @@ export async function undoLastBall(matchId: number) {
   // Delete the ball
   await lastBall.destroy();
 
-  // Broadcast
-  const liveScore = await getLiveScore(match.share_token);
-  broadcastToMatch(match.share_token, liveScore);
-
+  // Fire SSE broadcast in the background
+  broadcastInBackground(match.share_token);
   return { undone: true };
 }
 
