@@ -147,13 +147,15 @@ def seed_match(api):
 SCREENS = os.path.join(os.path.dirname(__file__), "screenshots")
 os.makedirs(SCREENS, exist_ok=True)
 
-def visit(page, url, name, expectations, *, wait_for=None, wait_ms=2500):
-    """Navigate to url, screenshot, then verify each expected snippet appears in the page text."""
+def visit(page, url, name, expectations, *, wait_for=None, wait_ms=3500):
+    """Navigate to url, screenshot, then verify each expected snippet appears in the page text.
+    Use 'domcontentloaded' instead of 'networkidle' because the live/score pages hold
+    an open SSE connection that means the network is never idle."""
     print(gray(f"\n  → {url}"))
-    page.goto(url, wait_until="networkidle", timeout=45000)
+    page.goto(url, wait_until="domcontentloaded", timeout=45000)
     if wait_for:
         try:
-            page.wait_for_selector(wait_for, timeout=8000)
+            page.wait_for_selector(wait_for, timeout=10000)
         except Exception:
             pass
     page.wait_for_timeout(wait_ms)  # let React render + SSE settle
@@ -161,9 +163,10 @@ def visit(page, url, name, expectations, *, wait_for=None, wait_ms=2500):
     page.screenshot(path=shot, full_page=True)
     print(gray(f"    saved {shot}"))
 
-    text = page.inner_text("body")
+    # Case-insensitive — many components apply CSS uppercase
+    text = page.inner_text("body").lower()
     for label, needle in expectations.items():
-        check(f"{name}: {label}", needle in text, f"looked for '{needle}'")
+        check(f"{name}: {label}", needle.lower() in text, f"looked for '{needle}'")
 
 def run(args):
     global PASS, FAIL
@@ -233,10 +236,15 @@ def run(args):
             "opening_batsman2_id": api.get(f"/api/teams/{team_b['id']}")["players"][1]["id"],
             "opening_bowler_id":   api.get(f"/api/teams/{team_a['id']}")["players"][2]["id"],
         }, auth=True)
-        # smash the chase
-        for _ in range(6):
-            api.post(f"/api/matches/{match['id']}/ball", {"runs": 6}, auth=True)
-        # ensure completed
+        # smash the chase — stop as soon as the match auto-completes
+        for _ in range(8):
+            try:
+                res = api.post(f"/api/matches/{match['id']}/ball", {"runs": 6}, auth=True)
+            except Exception:
+                break  # innings/match already closed
+            if res and (res.get("matchEnded") or res.get("targetReached")):
+                break
+        # belt-and-braces wait for completed flag
         for _ in range(5):
             m = api.get(f"/api/matches/{match['id']}")
             if m["status"] == "completed":

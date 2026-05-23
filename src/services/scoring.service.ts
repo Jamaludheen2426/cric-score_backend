@@ -75,16 +75,20 @@ function wideGetsExtraRun(match: Match, over: Over) {
 }
 
 export async function addBall(matchId: number, input: BallInput) {
-  const match = await Match.findByPk(matchId);
+  // Match + innings are independent on matchId — fetch both in one round-trip
+  // batch instead of two serial ones.
+  const [match, innings] = await Promise.all([
+    Match.findByPk(matchId),
+    Innings.findOne({
+      where: { match_id: matchId, status: 'live' },
+      order: [['innings_number', 'DESC']],
+    }),
+  ]);
   if (!match) throw new Error('Match not found');
   if (match.status !== 'live') throw new Error('Match is not live');
-
-  const innings = await Innings.findOne({
-    where: { match_id: matchId, status: 'live' },
-    order: [['innings_number', 'DESC']],
-  });
   if (!innings) throw new Error('No active innings');
 
+  // Over depends on innings.id so it must follow the lookup above.
   const over = await Over.findOne({
     where: { innings_id: innings.id, status: 'live' },
     order: [['over_number', 'DESC']],
@@ -92,7 +96,19 @@ export async function addBall(matchId: number, input: BallInput) {
   if (!over) throw new Error('No active over');
 
   const strikerId = innings.on_strike_batsman_id!;
-  const strikerCardBeforeBall = await BattingCard.findOne({ where: { innings_id: innings.id, player_id: strikerId } });
+  const countsAsWicket = wicketCounts(input);
+  if (input.is_wicket && !countsAsWicket) {
+    throw new Error('This wicket type is not valid on a no-ball');
+  }
+
+  // These three lookups are independent — fire them in parallel to
+  // collapse three Render→Aiven round-trips into one batch.
+  const [strikerCardBeforeBall, maxBatters, battingCardCount] = await Promise.all([
+    BattingCard.findOne({ where: { innings_id: innings.id, player_id: strikerId } }),
+    getMaxBattersForInnings(match, innings),
+    BattingCard.count({ where: { innings_id: innings.id } }),
+  ]);
+
   if (strikerCardBeforeBall?.is_out) {
     await completeInnings(match, innings, over);
     return {
@@ -102,14 +118,7 @@ export async function addBall(matchId: number, input: BallInput) {
     };
   }
 
-  const countsAsWicket = wicketCounts(input);
-  if (input.is_wicket && !countsAsWicket) {
-    throw new Error('This wicket type is not valid on a no-ball');
-  }
-
-  const maxBatters = await getMaxBattersForInnings(match, innings);
   const wicketsAfterThisBall = innings.total_wickets + (countsAsWicket ? 1 : 0);
-  const battingCardCount = await BattingCard.count({ where: { innings_id: innings.id } });
   const noReplacementAvailable = countsAsWicket && !input.new_batsman_id && (
     wicketsAfterThisBall >= maxBatters - 1 || battingCardCount >= maxBatters
   );
@@ -127,80 +136,71 @@ export async function addBall(matchId: number, input: BallInput) {
     ? input.runs + ballExtras
     : (input.extras || 0) + ballExtras;
 
-  // Ball number: count all balls (legal + extra) in this over
-  const existingBalls = await Ball.count({ where: { over_id: over.id } });
-  const ball_number = existingBalls + 1;
-
-  // Create ball record
-  const ball = await Ball.create({
-    over_id: over.id,
-    ball_number,
-    batsman_player_id: innings.on_strike_batsman_id!,
-    runs: batRuns,
-    is_wide: input.is_wide || false,
-    is_noball: input.is_noball || false,
-    is_wicket: countsAsWicket,
-    wicket_type: input.wicket_type as any,
-    dismissed_player_id: input.dismissed_player_id,
-    extras: totalExtras,
-  });
-
   const runsThisBall = batRuns + totalExtras;
 
-  // Update over stats
-  await over.update({
-    runs: over.runs + runsThisBall,
-    wickets: over.wickets + (countsAsWicket ? 1 : 0),
-    extras: over.extras + totalExtras,
-    legal_balls: over.legal_balls + (isLegal ? 1 : 0),
-  });
+  // The striker's batting card was already loaded above (strikerCardBeforeBall).
+  // Ball.count, the bowling card, and (for run-outs) the non-striker card
+  // are independent lookups — fetch them in parallel so we pay one
+  // Render→Aiven round-trip instead of three.
+  const [existingBalls, bowlingCard, nonStrikerCard] = await Promise.all([
+    Ball.count({ where: { over_id: over.id } }),
+    BowlingCard.findOne({ where: { innings_id: innings.id, player_id: over.bowler_player_id } }),
+    (countsAsWicket && input.dismissed_player_id && input.dismissed_player_id !== strikerId)
+      ? BattingCard.findOne({ where: { innings_id: innings.id, player_id: input.dismissed_player_id } })
+      : Promise.resolve(null),
+  ]);
+  const ball_number = existingBalls + 1;
 
-  // Update innings stats
-  await innings.update({
-    total_runs: innings.total_runs + runsThisBall,
-    total_wickets: innings.total_wickets + (countsAsWicket ? 1 : 0),
-    extras: innings.extras + totalExtras,
-  });
+  // Create ball + apply all stat updates in parallel.
+  const isOut = countsAsWicket && (input.dismissed_player_id === strikerId || !input.dismissed_player_id);
+  const newLegalBowlerBalls = (bowlingCard?.legal_balls || 0) + (isLegal ? 1 : 0);
+  const newBowlerOversFloat = Math.floor(newLegalBowlerBalls / 6) + (newLegalBowlerBalls % 6) / 10;
 
-  // Update batting card for on-strike batsman
-  const battingCard = await BattingCard.findOne({ where: { innings_id: innings.id, player_id: strikerId } });
-  if (battingCard) {
-    const isOut = countsAsWicket && (input.dismissed_player_id === strikerId || !input.dismissed_player_id);
-    await battingCard.update({
-      runs: battingCard.runs + batRuns,
-      balls: battingCard.balls + (isLegal ? 1 : 0),
-      fours: battingCard.fours + (batRuns === 4 ? 1 : 0),
-      sixes: battingCard.sixes + (batRuns === 6 ? 1 : 0),
+  const [ball] = await Promise.all([
+    Ball.create({
+      over_id: over.id,
+      ball_number,
+      batsman_player_id: innings.on_strike_batsman_id!,
+      runs: batRuns,
+      is_wide: input.is_wide || false,
+      is_noball: input.is_noball || false,
+      is_wicket: countsAsWicket,
+      wicket_type: input.wicket_type as any,
+      dismissed_player_id: input.dismissed_player_id,
+      extras: totalExtras,
+    }),
+    over.update({
+      runs: over.runs + runsThisBall,
+      wickets: over.wickets + (countsAsWicket ? 1 : 0),
+      extras: over.extras + totalExtras,
+      legal_balls: over.legal_balls + (isLegal ? 1 : 0),
+    }),
+    innings.update({
+      total_runs: innings.total_runs + runsThisBall,
+      total_wickets: innings.total_wickets + (countsAsWicket ? 1 : 0),
+      extras: innings.extras + totalExtras,
+    }),
+    strikerCardBeforeBall ? strikerCardBeforeBall.update({
+      runs: strikerCardBeforeBall.runs + batRuns,
+      balls: strikerCardBeforeBall.balls + (isLegal ? 1 : 0),
+      fours: strikerCardBeforeBall.fours + (batRuns === 4 ? 1 : 0),
+      sixes: strikerCardBeforeBall.sixes + (batRuns === 6 ? 1 : 0),
       is_out: isOut,
-      dismissal_type: isOut ? input.wicket_type : battingCard.dismissal_type,
-      bowler_id: isOut ? over.bowler_player_id : battingCard.bowler_id,
-    });
-  }
-
-  // If run-out, update non-striker's card if they were dismissed
-  if (countsAsWicket && input.dismissed_player_id && input.dismissed_player_id !== strikerId) {
-    const nonStrikerCard = await BattingCard.findOne({ where: { innings_id: innings.id, player_id: input.dismissed_player_id } });
-    if (nonStrikerCard) {
-      await nonStrikerCard.update({
-        is_out: true,
-        dismissal_type: 'run_out',
-      });
-    }
-  }
-
-  // Update bowling card
-  const bowlingCard = await BowlingCard.findOne({ where: { innings_id: innings.id, player_id: over.bowler_player_id } });
-  if (bowlingCard) {
-    const newLegalBalls = bowlingCard.legal_balls + (isLegal ? 1 : 0);
-    const oversFloat = Math.floor(newLegalBalls / 6) + (newLegalBalls % 6) / 10;
-    await bowlingCard.update({
+      dismissal_type: isOut ? input.wicket_type : strikerCardBeforeBall.dismissal_type,
+      bowler_id: isOut ? over.bowler_player_id : strikerCardBeforeBall.bowler_id,
+    }) : Promise.resolve(),
+    bowlingCard ? bowlingCard.update({
       runs: bowlingCard.runs + runsThisBall,
       wickets: bowlingCard.wickets + (countsAsWicket && input.wicket_type !== 'run_out' ? 1 : 0),
       extras: bowlingCard.extras + totalExtras,
-      legal_balls: newLegalBalls,
-      overs: oversFloat,
-    });
-  }
+      legal_balls: newLegalBowlerBalls,
+      overs: newBowlerOversFloat,
+    }) : Promise.resolve(),
+    nonStrikerCard ? nonStrikerCard.update({
+      is_out: true,
+      dismissal_type: 'run_out',
+    }) : Promise.resolve(),
+  ]);
 
   // Handle new batsman coming in
   if (countsAsWicket && input.new_batsman_id) {
