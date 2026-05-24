@@ -128,12 +128,16 @@ export async function addBall(matchId: number, input: BallInput) {
   }
 
   const isLegal = !input.is_wide && !input.is_noball;
-  const ballExtras = (input.is_wide || input.is_noball)
-    ? (input.is_wide ? (wideGetsExtraRun(match, over) ? 1 : 0) : 1)
-    : 0;
+  // A wide is ALWAYS 1 base penalty (standard cricket rule). Strict/T20 or
+  // death-over config bumps it to 2. Plus any runs the batsmen actually ran
+  // while the ball was wide. (Previous logic dropped the base 1 in normal
+  // mode — caused total runs / extras to be off by one per wide.)
+  const widePenalty = input.is_wide ? (wideGetsExtraRun(match, over) ? 2 : 1) : 0;
+  const noBallPenalty = input.is_noball ? 1 : 0;
+  const ballExtras = widePenalty + noBallPenalty;
   const batRuns = input.is_wide ? 0 : input.runs;
   const totalExtras = input.is_wide
-    ? input.runs + ballExtras
+    ? input.runs + widePenalty
     : (input.extras || 0) + ballExtras;
 
   const runsThisBall = batRuns + totalExtras;
