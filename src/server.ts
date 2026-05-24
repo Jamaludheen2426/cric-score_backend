@@ -29,13 +29,24 @@ app.use('/api/tournaments', tournamentRoutes);
 // 404
 app.use((_, res) => res.status(404).json({ success: false, error: 'Route not found' }));
 
-// Sync DB and start
+// Sync DB and start.
+//
+// NEVER use `sync({ alter: true })` in production: every boot would try to
+// re-create UNIQUE indexes, and MySQL caps each table at 64 keys, so after
+// ~60 redeploys the service stops booting (ER_TOO_MANY_KEYS). We did just
+// hit that — the duplicate indexes were cleaned up via scripts/fix_indexes.js
+// and this code now defaults to plain `sync()` which only creates tables
+// that don't exist yet. Schema changes go through a proper migration.
+//
+// Setting DB_SYNC_ALTER=true in env opts in to the old behaviour (useful
+// only on a clean local dev DB).
 async function bootstrap() {
   try {
     await sequelize.authenticate();
     console.log('✅ DB connected');
-    await sequelize.sync({ alter: true });
-    console.log('✅ DB synced');
+    const useAlter = process.env.DB_SYNC_ALTER === 'true';
+    await sequelize.sync(useAlter ? { alter: true } : {});
+    console.log(useAlter ? '✅ DB synced (alter)' : '✅ DB schema verified');
     app.listen(PORT, () => console.log(`🏏 Cricket scorer API running on port ${PORT}`));
   } catch (e) {
     console.error('❌ Failed to start:', e);
