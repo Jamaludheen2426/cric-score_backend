@@ -47,8 +47,12 @@ export async function verifyPin(matchId: number, pin: string) {
   if (!match) throw new Error('Match not found');
   if (match.scorer_pin !== pin) throw new Error('Invalid PIN');
 
-  // Revoke existing sessions
+  // Revoke existing sessions in the DB AND in the in-memory auth cache,
+  // so the old token can't keep working via the cache after the new
+  // PIN verification.
   await MatchSession.destroy({ where: { match_id: matchId } });
+  const { invalidateSessionCacheForMatch } = await import('../middleware/auth');
+  invalidateSessionCacheForMatch(matchId);
 
   const token = uuidv4() + uuidv4();
   const expires_at = new Date(Date.now() + 12 * 60 * 60 * 1000); // 12h
