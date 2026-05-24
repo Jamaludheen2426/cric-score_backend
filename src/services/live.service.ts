@@ -150,7 +150,7 @@ export async function getLiveScore(shareToken: string) {
     include: [{
       model: Over,
       as: 'over',
-      attributes: ['id', 'innings_id', 'over_number'],
+      attributes: ['id', 'innings_id', 'over_number', 'bowler_player_id'],
       where: { innings_id: inningsIds },
     }],
     order: [
@@ -170,9 +170,22 @@ export async function getLiveScore(shareToken: string) {
   }
 
   const narrativesByInnings = new Map<number, { partnerships: any[]; fallOfWickets: any[] }>();
+  // Per-bowler wides and no-balls conceded — derived from the ball log so we
+  // don't have to add columns to bowling_cards. Keyed by `${inningsId}:${bowlerPlayerId}`.
+  const bowlerExtras = new Map<string, { wides: number; noballs: number }>();
   for (const inn of allInnings) {
     const balls = ballsByInnings.get(inn.id) || [];
     narrativesByInnings.set(inn.id, computeNarratives(inn, balls));
+    for (const b of balls as any[]) {
+      if (!b.is_wide && !b.is_noball) continue;
+      const bowlerId = b.over?.bowler_player_id;
+      if (!bowlerId) continue;
+      const key = `${inn.id}:${bowlerId}`;
+      const cur = bowlerExtras.get(key) || { wides: 0, noballs: 0 };
+      if (b.is_wide)   cur.wides   += 1;
+      if (b.is_noball) cur.noballs += 1;
+      bowlerExtras.set(key, cur);
+    }
   }
 
   // Current over balls
@@ -262,6 +275,12 @@ export async function getLiveScore(shareToken: string) {
     },
     innings: allInnings.map(inn => {
       const narr = narrativesByInnings.get(inn.id) || { partnerships: [], fallOfWickets: [] };
+      // Decorate each bowling card with wides + noballs conceded from the ball log
+      const decoratedBowling = ((inn as any).bowlingCards || []).map((bc: any) => {
+        const e = bowlerExtras.get(`${inn.id}:${bc.player_id}`) || { wides: 0, noballs: 0 };
+        const plain = typeof bc.toJSON === 'function' ? bc.toJSON() : bc;
+        return { ...plain, wides: e.wides, noballs: e.noballs };
+      });
       return {
         id: inn.id,
         innings_number: inn.innings_number,
@@ -284,7 +303,7 @@ export async function getLiveScore(shareToken: string) {
         currentBowler: (inn as any).currentBowler,
         onStrike: (inn as any).onStrike,
         battingCards: (inn as any).battingCards,
-        bowlingCards: (inn as any).bowlingCards,
+        bowlingCards: decoratedBowling,
         partnerships: narr.partnerships,
         fallOfWickets: narr.fallOfWickets,
         run_rate: inn === currentInnings ? runRate : null,

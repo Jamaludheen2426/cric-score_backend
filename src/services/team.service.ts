@@ -1,4 +1,5 @@
-import { Team, Player } from '../models';
+import { Op } from 'sequelize';
+import { Team, Player, Match } from '../models';
 import type { PlayerAttributes } from '../models/Player';
 
 export async function getAllTeams() {
@@ -27,6 +28,16 @@ export async function updateTeam(id: number, data: Partial<{ name: string; logo_
 export async function deleteTeam(id: number) {
   const team = await Team.findByPk(id);
   if (!team) throw new Error('Team not found');
+
+  // Catch the foreign-key error before it happens and return a useful
+  // message. Without this the frontend just sees a generic 400 from MySQL.
+  const matchCount = await Match.count({
+    where: { [Op.or]: [{ team_a_id: id }, { team_b_id: id }] },
+  });
+  if (matchCount > 0) {
+    throw new Error(`Can't delete ${team.name} — it's used in ${matchCount} match${matchCount === 1 ? '' : 'es'}. Archive or remove those matches first.`);
+  }
+
   await team.destroy();
 }
 

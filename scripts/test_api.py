@@ -263,11 +263,11 @@ def run(cfg):
 
     live = api.get(f"/api/matches/live/{match['share_token']}")
     inn1 = live["innings"][0]
-    expected_runs = 1 + 4 + 6 + 0 + 2 + 2  # wide adds +2 (1 run on wide + 1 penalty)
-    # actually: wide with runs=1 → extras = 1 (penalty) + 1 (run) = 2 total extras, plus 0 batsman runs
-    # so total runs = 1 + 4 + 6 + 0 + 2 + 2 = 15
+    # Local-tournament rule: NORMAL-over wide has NO penalty (just re-bowled).
+    # So {"runs": 1, "is_wide": True} contributes only the 1 running run.
+    expected_runs = 1 + 4 + 6 + 0 + 1 + 2     # = 14
     check(f"Innings total_runs = {expected_runs}", inn1["total_runs"] == expected_runs, f"got {inn1['total_runs']}")
-    check("Extras = 2 (wide)",                     inn1["extras"] == 2, f"got {inn1['extras']}")
+    check("Extras = 1 (running run on wide)",      inn1["extras"] == 1, f"got {inn1['extras']}")
     over = live["currentOver"]
     check("Legal balls in over = 5",               over["legal_balls"] == 5, f"got {over['legal_balls']}")
 

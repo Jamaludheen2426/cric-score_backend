@@ -160,15 +160,17 @@ export async function addBall(matchId: number, input: BallInput) {
 
     const isLegal = !input.is_wide && !input.is_noball;
     const inDeath = match.death_overs_from != null && over.over_number >= match.death_overs_from;
-    // Wide penalty is ALWAYS at least 1 (standard cricket rule). Strict/T20
-    // and death-overs config bump it to 2. Plus any runs the batsmen ran
-    // while the ball was wide stay on top of the penalty.
-    const widePenalty = input.is_wide ? (match.wide_rule === 'strict' || inDeath ? 2 : 1) : 0;
+    // Local-tournament wide rule:
+    //   • Normal over wide: NO penalty run, just re-bowled (ball not counted).
+    //   • Death over wide:  +1 penalty + re-bowled.
+    //   • Strict (T20):     +1 penalty + re-bowled (regardless of death).
+    // Running runs on a wide always count.
+    const widePenalty = input.is_wide && (inDeath || match.wide_rule === 'strict') ? 1 : 0;
     const noBallPenalty = input.is_noball ? 1 : 0;
     const ballExtras = widePenalty + noBallPenalty;
     const batRuns = input.is_wide ? 0 : input.runs;
     const totalExtras = input.is_wide
-      ? input.runs + widePenalty                    // running on the wide + the wide penalty
+      ? input.runs + widePenalty                    // running on the wide + the (sometimes zero) wide penalty
       : (input.extras || 0) + ballExtras;
     const runsThisBall = batRuns + totalExtras;
     const ball_number = existingBalls + 1;
