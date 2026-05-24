@@ -1,9 +1,16 @@
 import { Request, Response } from 'express';
 import * as matchService from '../services/match.service';
 import * as scoringService from '../services/scoring.service';
+import * as scoringFast from '../services/scoring-fast.service';
 import * as liveService from '../services/live.service';
 import { addSseClient } from '../middleware/sse';
 import { v4 as uuidv4 } from 'uuid';
+
+// addBall implementation switch.
+//   default = fast raw-SQL path (collapses ~6 round-trips into 2).
+//   USE_LEGACY_ADDBALL=true reverts to the Sequelize implementation
+//   for one-deploy rollback safety while we burn in the new code.
+const useFastAddBall = process.env.USE_LEGACY_ADDBALL !== 'true';
 
 const ok = (res: Response, data: any) => res.json({ success: true, data });
 const err = (res: Response, e: any, code = 400) => res.status(code).json({ success: false, error: e?.message || String(e) });
@@ -36,7 +43,10 @@ export async function startMatch(req: Request, res: Response) {
 }
 
 export async function addBall(req: Request, res: Response) {
-  try { ok(res, await scoringService.addBall(Number(req.params.id), req.body)); } catch (e) { err(res, e); }
+  try {
+    const impl = useFastAddBall ? scoringFast.addBall : scoringService.addBall;
+    ok(res, await impl(Number(req.params.id), req.body));
+  } catch (e) { err(res, e); }
 }
 
 export async function endOver(req: Request, res: Response) {
