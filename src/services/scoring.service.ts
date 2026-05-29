@@ -43,8 +43,14 @@ async function completeInnings(match: Match, innings: Innings, over: Over) {
     if (!first || first.total_runs !== second.total_runs) {
       await match.update({ status: 'completed' });
     }
-  } else if (innings.innings_number >= 4) {
-    await match.update({ status: 'completed' });
+  } else if (innings.innings_number > 2 && innings.innings_number % 2 === 0) {
+    const defendingSuperInnings = await Innings.findOne({
+      where: { match_id: match.id, innings_number: innings.innings_number - 1 },
+    });
+    const chasingSuperInnings = await innings.reload();
+    if (!defendingSuperInnings || defendingSuperInnings.total_runs !== chasingSuperInnings.total_runs) {
+      await match.update({ status: 'completed' });
+    }
   }
   broadcastInBackground(match.share_token);
 }
@@ -311,7 +317,7 @@ export async function addBall(matchId: number, input: BallInput) {
   const inningsOversLimit = innings.innings_number > 2 ? 1 : Number(match.total_overs);
   const oversFinished = totalLegalBalls >= inningsOversLimit * perOver;
   const targetReached = innings.target != null && finalRuns >= innings.target;
-  const tiedSecondInnings = innings.innings_number === 2 && innings.target != null && finalRuns === innings.target - 1;
+  const tiedTargetInnings = innings.innings_number >= 2 && innings.target != null && finalRuns === innings.target - 1;
 
   if (allOut || oversFinished || targetReached) {
     await completeInnings(match, innings, over);
@@ -321,7 +327,7 @@ export async function addBall(matchId: number, input: BallInput) {
       allOut,
       oversFinished,
       targetReached,
-      matchEnded: innings.innings_number >= 4 || (innings.innings_number === 2 && !tiedSecondInnings),
+      matchEnded: innings.innings_number >= 2 && innings.target != null && !tiedTargetInnings,
     };
   }
 
@@ -715,11 +721,20 @@ export async function endInnings(matchId: number, data: {
     && firstInnings
     && secondInnings
     && firstInnings.total_runs === secondInnings.total_runs;
-  if (currentInnings.innings_number >= 4) {
-    throw new Error('Super over is complete; end the match instead');
-  }
-  if (currentInnings.innings_number >= 2 && !tiedAfterSecond && currentInnings.innings_number !== 3) {
-    throw new Error('Second innings already exists; end the match instead');
+  const previousSuperInnings = currentInnings.innings_number > 2 && currentInnings.innings_number % 2 === 0
+    ? await Innings.findOne({ where: { match_id: matchId, innings_number: currentInnings.innings_number - 1 } })
+    : null;
+  const tiedAfterSuperOver = Boolean(
+    previousSuperInnings &&
+    previousSuperInnings.total_runs === currentInnings.total_runs
+  );
+  const canOpenNextInnings =
+    currentInnings.innings_number === 1 ||
+    tiedAfterSecond ||
+    (currentInnings.innings_number > 2 && currentInnings.innings_number % 2 === 1) ||
+    tiedAfterSuperOver;
+  if (!canOpenNextInnings) {
+    throw new Error('Innings sequence is complete; end the match instead');
   }
 
   if (data.opening_batsman1_id === data.opening_batsman2_id) {
@@ -742,9 +757,9 @@ export async function endInnings(matchId: number, data: {
     await Over.update({ status: 'completed' }, { where: { innings_id: currentInnings.id, status: 'live' } });
   }
 
-  // Normal chase and second super-over innings get a target. The first
-  // super-over innings starts without a target.
-  const target = currentInnings.innings_number === 2 ? undefined : currentInnings.total_runs + 1;
+  // Normal chase and the second innings of each super over get a target.
+  // First innings of a new super over starts level, without a target.
+  const target = currentInnings.innings_number % 2 === 0 ? undefined : currentInnings.total_runs + 1;
 
   // Swap batting/bowling teams
   const newInnings = await Innings.create({
