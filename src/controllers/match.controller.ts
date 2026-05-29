@@ -53,6 +53,46 @@ export async function endOver(req: Request, res: Response) {
   try { ok(res, await scoringService.endOver(Number(req.params.id), req.body.next_bowler_id)); } catch (e) { err(res, e); }
 }
 
+export async function correctPlayers(req: Request, res: Response) {
+  try { ok(res, await scoringService.correctCurrentPlayers(Number(req.params.id), req.body)); } catch (e) { err(res, e); }
+}
+
+export async function reviseTarget(req: Request, res: Response) {
+  try { ok(res, await scoringService.reviseTarget(Number(req.params.id), Number(req.body.target))); } catch (e) { err(res, e); }
+}
+
+export async function addPenalty(req: Request, res: Response) {
+  try { ok(res, await scoringService.addPenaltyRuns(Number(req.params.id), Number(req.body.runs), req.body.reason)); } catch (e) { err(res, e); }
+}
+
+export async function auditLogs(req: Request, res: Response) {
+  try { ok(res, await scoringService.getAuditLogs(Number(req.params.id))); } catch (e) { err(res, e); }
+}
+
+export async function exportCsv(req: Request, res: Response) {
+  try {
+    const match = await matchService.getMatchById(Number(req.params.id));
+    if (!match) return res.status(404).send('Match not found');
+    const live = await liveService.getLiveScore(match.share_token);
+    const rows = ['innings,section,name,runs,balls,wickets,overs,extras,notes'];
+    for (const innings of live.innings || []) {
+      for (const card of innings.battingCards || []) {
+        rows.push([innings.innings_number, 'batting', card.player?.name || '', card.runs, card.balls, '', '', '', card.is_out ? card.dismissal_type || 'out' : 'not out'].map(v => `"${String(v).replace(/"/g, '""')}"`).join(','));
+      }
+      for (const card of innings.bowlingCards || []) {
+        rows.push([innings.innings_number, 'bowling', card.player?.name || '', card.runs, '', card.wickets, card.overs, card.extras, ''].map(v => `"${String(v).replace(/"/g, '""')}"`).join(','));
+      }
+    }
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="match-${match.id}-score.csv"`);
+    res.send(rows.join('\n'));
+  } catch (e) { err(res, e); }
+}
+
+export async function unlockMatch(req: Request, res: Response) {
+  try { ok(res, await matchService.unlockMatch(Number(req.params.id))); } catch (e) { err(res, e); }
+}
+
 export async function endInnings(req: Request, res: Response) {
   try { ok(res, await scoringService.endInnings(Number(req.params.id), req.body)); } catch (e) { err(res, e); }
 }

@@ -136,3 +136,19 @@ export async function endMatch(matchId: number, _result?: string) {
   await match.update({ status: 'completed' });
   return match;
 }
+
+export async function unlockMatch(matchId: number) {
+  const match = await Match.findByPk(matchId);
+  if (!match) throw new Error('Match not found');
+  if (match.status !== 'completed') throw new Error('Only completed matches can be unlocked');
+
+  const latestInnings = await Innings.findOne({
+    where: { match_id: matchId },
+    order: [['innings_number', 'DESC']],
+  });
+  if (!latestInnings) throw new Error('No innings found to reopen');
+
+  await match.update({ status: 'live' });
+  await latestInnings.update({ status: 'live' });
+  return match;
+}

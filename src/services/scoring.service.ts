@@ -1,6 +1,8 @@
 ﻿import { Match, Innings, Over, Ball, BattingCard, BowlingCard, Player } from '../models';
+import { ScoreAuditLog } from '../models';
 import { broadcastToMatch } from '../middleware/sse';
 import { getLiveScore } from './live.service';
+import { widePenaltyRuns } from './wide-rule';
 
 /**
  * Fire-and-forget SSE broadcast. We DON'T await this so the API request can
@@ -56,22 +58,30 @@ export interface BallInput {
   dismissed_player_id?: number;
   new_batsman_id?: number; // Required when wicket falls
   extras?: number;
+  extra_type?: 'bye' | 'leg_bye' | 'wide' | 'no_ball';
+  next_striker_id?: number;
 }
 
-const WICKET_TYPES_ALLOWED_ON_NO_BALL = new Set(['run_out', 'obstructing_field', 'retired']);
+const WICKET_TYPES_ALLOWED_ON_NO_BALL = new Set(['run_out', 'obstructing_field', 'retired', 'retired_hurt', 'retired_out']);
 
 function wicketCounts(input: BallInput) {
   if (!input.is_wicket) return false;
+  if (input.wicket_type === 'retired_hurt') return false;
+  if (input.wicket_type === 'retired_out') return true;
   if (!input.is_noball) return true;
   return WICKET_TYPES_ALLOWED_ON_NO_BALL.has(input.wicket_type || '');
 }
 
-function isDeathOver(match: Match, over: Over) {
-  return match.death_overs_from != null && over.over_number >= match.death_overs_from;
+function isRetiredHurt(input: BallInput) {
+  return Boolean(input.is_wicket && input.wicket_type === 'retired_hurt');
 }
 
-function wideGetsExtraRun(match: Match, over: Over) {
-  return match.wide_rule === 'strict' || isDeathOver(match, over);
+async function audit(matchId: number, action: string, details?: object) {
+  try {
+    await ScoreAuditLog.create({ match_id: matchId, action, details });
+  } catch (err) {
+    console.error('[audit] write failed:', (err as Error)?.message);
+  }
 }
 
 export async function addBall(matchId: number, input: BallInput) {
@@ -97,7 +107,8 @@ export async function addBall(matchId: number, input: BallInput) {
 
   const strikerId = innings.on_strike_batsman_id!;
   const countsAsWicket = wicketCounts(input);
-  if (input.is_wicket && !countsAsWicket) {
+  const retiredHurt = isRetiredHurt(input);
+  if (input.is_wicket && !countsAsWicket && !retiredHurt) {
     throw new Error('This wicket type is not valid on a no-ball');
   }
 
@@ -126,21 +137,29 @@ export async function addBall(matchId: number, input: BallInput) {
   if (countsAsWicket && !input.new_batsman_id && !noReplacementAvailable) {
     throw new Error('New batsman is required before scoring the next ball');
   }
+  if (retiredHurt && !input.new_batsman_id) {
+    throw new Error('New batsman is required for retired hurt');
+  }
 
   const isLegal = !input.is_wide && !input.is_noball;
+  const isByeLike = input.extra_type === 'bye' || input.extra_type === 'leg_bye';
   // Local-tournament wide rule (matches scoring-fast.service.ts):
   //   • Normal over wide: NO penalty run, just re-bowled.
   //   • Death over wide:  +1 penalty + re-bowled.
   //   • Strict (T20):     +1 penalty + re-bowled.
-  const widePenalty = input.is_wide ? (wideGetsExtraRun(match, over) ? 1 : 0) : 0;
+  const widePenalty = input.is_wide ? widePenaltyRuns(match, over) : 0;
   const noBallPenalty = input.is_noball ? 1 : 0;
   const ballExtras = widePenalty + noBallPenalty;
-  const batRuns = input.is_wide ? 0 : input.runs;
+  const batRuns = input.is_wide || isByeLike ? 0 : input.runs;
   const totalExtras = input.is_wide
     ? input.runs + widePenalty
+    : isByeLike
+      ? input.runs + noBallPenalty
     : (input.extras || 0) + ballExtras;
 
   const runsThisBall = batRuns + totalExtras;
+  const bowlerRunsThisBall = isByeLike ? noBallPenalty : runsThisBall;
+  const strikeRuns = isByeLike ? input.runs : batRuns;
 
   // The striker's batting card was already loaded above (strikerCardBeforeBall).
   // Ball.count, the bowling card, and (for run-outs) the non-striker card
@@ -172,6 +191,8 @@ export async function addBall(matchId: number, input: BallInput) {
       wicket_type: input.wicket_type as any,
       dismissed_player_id: input.dismissed_player_id,
       extras: totalExtras,
+      extra_type: input.is_wide ? 'wide' : input.is_noball ? 'no_ball' : input.extra_type,
+      next_striker_id: input.next_striker_id,
     }),
     over.update({
       runs: over.runs + runsThisBall,
@@ -194,7 +215,7 @@ export async function addBall(matchId: number, input: BallInput) {
       bowler_id: isOut ? over.bowler_player_id : strikerCardBeforeBall.bowler_id,
     }) : Promise.resolve(),
     bowlingCard ? bowlingCard.update({
-      runs: bowlingCard.runs + runsThisBall,
+      runs: bowlingCard.runs + bowlerRunsThisBall,
       wickets: bowlingCard.wickets + (countsAsWicket && input.wicket_type !== 'run_out' ? 1 : 0),
       extras: bowlingCard.extras + totalExtras,
       legal_balls: newLegalBowlerBalls,
@@ -207,7 +228,7 @@ export async function addBall(matchId: number, input: BallInput) {
   ]);
 
   // Handle new batsman coming in
-  if (countsAsWicket && input.new_batsman_id) {
+  if ((countsAsWicket || retiredHurt) && input.new_batsman_id) {
     if (battingCardCount >= maxBatters) {
       throw new Error('No batting slots remain for a new batsman');
     }
@@ -229,10 +250,15 @@ export async function addBall(matchId: number, input: BallInput) {
 
     // Update innings current batsmen
     const isStriker = dismissedId === innings.current_batsman1_id;
+    const nextBatsman1 = isStriker ? input.new_batsman_id : innings.current_batsman1_id!;
+    const nextBatsman2 = !isStriker ? input.new_batsman_id : innings.current_batsman2_id!;
+    const requestedStriker = input.next_striker_id;
     await innings.update({
-      current_batsman1_id: isStriker ? input.new_batsman_id : innings.current_batsman1_id,
-      current_batsman2_id: !isStriker ? input.new_batsman_id : innings.current_batsman2_id,
-      on_strike_batsman_id: isStriker ? input.new_batsman_id : innings.on_strike_batsman_id,
+      current_batsman1_id: nextBatsman1,
+      current_batsman2_id: nextBatsman2,
+      on_strike_batsman_id: requestedStriker && [nextBatsman1, nextBatsman2].includes(requestedStriker)
+        ? requestedStriker
+        : (isStriker ? input.new_batsman_id : innings.on_strike_batsman_id),
     });
   }
 
@@ -254,7 +280,7 @@ export async function addBall(matchId: number, input: BallInput) {
   const inningsPatch: Partial<{ on_strike_batsman_id: number; total_overs_bowled: number }> = {
     total_overs_bowled: newTotalOversBowled,
   };
-  if (isLegal && !countsAsWicket && batRuns % 2 === 1) {
+  if (isLegal && !countsAsWicket && !retiredHurt && strikeRuns % 2 === 1) {
     inningsPatch.on_strike_batsman_id = innings.on_strike_batsman_id === innings.current_batsman1_id
       ? innings.current_batsman2_id!
       : innings.current_batsman1_id!;
@@ -280,6 +306,7 @@ export async function addBall(matchId: number, input: BallInput) {
 
   // Fire SSE broadcast in the background — the API can return now.
   broadcastInBackground(match.share_token);
+  audit(matchId, 'ball_added', { input, ball_id: ball.id });
 
   return { ball, innings };
 }
@@ -334,7 +361,117 @@ export async function endOver(matchId: number, nextBowlerId: number) {
   }
 
   broadcastInBackground(match.share_token);
+  audit(matchId, 'over_ended', { next_bowler_id: nextBowlerId });
   return newOver;
+}
+
+export async function correctCurrentPlayers(matchId: number, data: {
+  current_batsman1_id?: number;
+  current_batsman2_id?: number;
+  on_strike_batsman_id?: number;
+  current_bowler_id?: number;
+}) {
+  const match = await Match.findByPk(matchId);
+  if (!match) throw new Error('Match not found');
+  if (match.status !== 'live') throw new Error('Match is not live');
+
+  const innings = await Innings.findOne({ where: { match_id: matchId, status: 'live' } });
+  if (!innings) throw new Error('No active innings');
+
+  const patch: Record<string, number> = {};
+
+  if (data.current_batsman1_id || data.current_batsman2_id || data.on_strike_batsman_id) {
+    const batsman1Id = data.current_batsman1_id || innings.current_batsman1_id;
+    const batsman2Id = data.current_batsman2_id || innings.current_batsman2_id;
+    const onStrikeId = data.on_strike_batsman_id || innings.on_strike_batsman_id;
+
+    if (!batsman1Id || !batsman2Id || !onStrikeId) throw new Error('Both batsmen and striker are required');
+    if (batsman1Id === batsman2Id) throw new Error('Current batsmen must be different players');
+    if (![batsman1Id, batsman2Id].includes(onStrikeId)) throw new Error('Striker must be one of the current batsmen');
+
+    const validBatsmen = await Player.count({ where: { id: [batsman1Id, batsman2Id], team_id: innings.batting_team_id } });
+    if (validBatsmen !== 2) throw new Error('Current batsmen must belong to batting team');
+
+    const maxPosition = (await BattingCard.max('batting_position', { where: { innings_id: innings.id } }) as number | null) || 0;
+    let nextPosition = maxPosition + 1;
+    for (const playerId of [batsman1Id, batsman2Id]) {
+      const card = await BattingCard.findOne({ where: { innings_id: innings.id, player_id: playerId } });
+      if (card?.is_out) throw new Error('Cannot bring back a batter who is already out');
+      if (!card) {
+        await BattingCard.create({ innings_id: innings.id, player_id: playerId, batting_position: nextPosition });
+        nextPosition += 1;
+      }
+    }
+
+    patch.current_batsman1_id = batsman1Id;
+    patch.current_batsman2_id = batsman2Id;
+    patch.on_strike_batsman_id = onStrikeId;
+  }
+
+  if (data.current_bowler_id) {
+    const bowler = await Player.findOne({ where: { id: data.current_bowler_id, team_id: innings.bowling_team_id } });
+    if (!bowler) throw new Error('Current bowler must belong to bowling team');
+
+    const over = await Over.findOne({ where: { innings_id: innings.id, status: 'live' }, order: [['over_number', 'DESC']] });
+    if (!over) throw new Error('No active over');
+
+    await over.update({ bowler_player_id: data.current_bowler_id });
+    const card = await BowlingCard.findOne({ where: { innings_id: innings.id, player_id: data.current_bowler_id } });
+    if (!card) await BowlingCard.create({ innings_id: innings.id, player_id: data.current_bowler_id });
+    patch.current_bowler_id = data.current_bowler_id;
+  }
+
+  await innings.update(patch);
+  broadcastInBackground(match.share_token);
+  audit(matchId, 'players_corrected', data);
+  return innings;
+}
+
+export async function reviseTarget(matchId: number, target: number) {
+  const match = await Match.findByPk(matchId);
+  if (!match) throw new Error('Match not found');
+  if (match.status !== 'live') throw new Error('Match is not live');
+  if (!Number.isFinite(target) || target < 1) throw new Error('Target must be a positive number');
+
+  const innings = await Innings.findOne({
+    where: { match_id: matchId, status: 'live' },
+    order: [['innings_number', 'DESC']],
+  });
+  if (!innings) throw new Error('No active innings');
+  await innings.update({ target });
+  broadcastInBackground(match.share_token);
+  audit(matchId, 'target_revised', { target });
+  return innings;
+}
+
+export async function addPenaltyRuns(matchId: number, runs: number, reason?: string) {
+  const match = await Match.findByPk(matchId);
+  if (!match) throw new Error('Match not found');
+  if (match.status !== 'live') throw new Error('Match is not live');
+  if (!Number.isFinite(runs) || runs < 1) throw new Error('Penalty runs must be positive');
+
+  const innings = await Innings.findOne({
+    where: { match_id: matchId, status: 'live' },
+    order: [['innings_number', 'DESC']],
+  });
+  if (!innings) throw new Error('No active innings');
+  const over = await Over.findOne({ where: { innings_id: innings.id, status: 'live' }, order: [['over_number', 'DESC']] });
+
+  await Promise.all([
+    innings.update({ total_runs: innings.total_runs + runs, extras: innings.extras + runs }),
+    over ? over.update({ runs: over.runs + runs, extras: over.extras + runs }) : Promise.resolve(),
+  ]);
+  broadcastInBackground(match.share_token);
+  audit(matchId, 'penalty_runs_added', { runs, reason });
+  return innings;
+}
+
+export async function getAuditLogs(matchId: number) {
+  return ScoreAuditLog.findAll({
+    where: { match_id: matchId },
+    order: [['created_at', 'DESC']],
+    limit: 100,
+  });
 }
 
 export async function endInnings(matchId: number, data: {
@@ -407,6 +544,7 @@ export async function endInnings(matchId: number, data: {
   await BowlingCard.create({ innings_id: newInnings.id, player_id: data.opening_bowler_id });
 
   broadcastInBackground(match.share_token);
+  audit(matchId, 'innings_started', data);
   return newInnings;
 }
 
@@ -435,6 +573,8 @@ export async function undoLastBall(matchId: number) {
 
   const isLegal = !lastBall.is_wide && !lastBall.is_noball;
   const runsThisBall = lastBall.runs + lastBall.extras;
+  const isByeLike = lastBall.extra_type === 'bye' || lastBall.extra_type === 'leg_bye';
+  const bowlerRunsThisBall = isByeLike ? (lastBall.is_noball ? 1 : 0) : runsThisBall;
 
   // Reverse over stats
   await over.update({
@@ -458,7 +598,7 @@ export async function undoLastBall(matchId: number) {
     const wasOut = lastBall.is_wicket && (lastBall.dismissed_player_id === strikerId || !lastBall.dismissed_player_id);
     await battingCard.update({
       runs: battingCard.runs - (lastBall.is_wide ? 0 : lastBall.runs),
-      balls: battingCard.balls - (lastBall.is_wide ? 0 : 1),
+      balls: battingCard.balls - (isLegal ? 1 : 0),
       fours: battingCard.fours - (lastBall.runs === 4 && !lastBall.is_wide ? 1 : 0),
       sixes: battingCard.sixes - (lastBall.runs === 6 ? 1 : 0),
       ...(wasOut ? { is_out: false, dismissal_type: null, bowler_id: null } : {}),
@@ -479,7 +619,7 @@ export async function undoLastBall(matchId: number) {
     const newLegalBalls = bowlingCard.legal_balls - (isLegal ? 1 : 0);
     const oversFloat = Math.floor(newLegalBalls / 6) + (newLegalBalls % 6) / 10;
     await bowlingCard.update({
-      runs: bowlingCard.runs - runsThisBall,
+      runs: bowlingCard.runs - bowlerRunsThisBall,
       wickets: bowlingCard.wickets - (lastBall.is_wicket && lastBall.wicket_type !== 'run_out' ? 1 : 0),
       extras: bowlingCard.extras - lastBall.extras,
       legal_balls: newLegalBalls,
@@ -519,9 +659,6 @@ export async function undoLastBall(matchId: number) {
 
   // Fire SSE broadcast in the background
   broadcastInBackground(match.share_token);
+  audit(matchId, 'ball_undone', { ball_id: lastBall.id });
   return { undone: true };
 }
-
-
-
-

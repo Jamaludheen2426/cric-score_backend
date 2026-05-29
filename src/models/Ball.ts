@@ -10,9 +10,11 @@ export interface BallAttributes {
   is_wide: boolean;
   is_noball: boolean;
   is_wicket: boolean;
-  wicket_type?: 'bowled' | 'caught' | 'lbw' | 'run_out' | 'stumped' | 'hit_wicket' | 'obstructing_field' | 'retired';
+  wicket_type?: 'bowled' | 'caught' | 'lbw' | 'run_out' | 'stumped' | 'hit_wicket' | 'obstructing_field' | 'retired' | 'retired_hurt' | 'retired_out';
   dismissed_player_id?: number;
   extras: number;
+  extra_type?: 'bye' | 'leg_bye' | 'wide' | 'no_ball';
+  next_striker_id?: number;
 }
 
 export interface BallCreationAttributes extends Optional<BallAttributes, 'id' | 'is_wide' | 'is_noball' | 'is_wicket' | 'extras'> {}
@@ -26,9 +28,11 @@ class Ball extends Model<BallAttributes, BallCreationAttributes> implements Ball
   public is_wide!: boolean;
   public is_noball!: boolean;
   public is_wicket!: boolean;
-  public wicket_type?: 'bowled' | 'caught' | 'lbw' | 'run_out' | 'stumped' | 'hit_wicket' | 'obstructing_field' | 'retired';
+  public wicket_type?: 'bowled' | 'caught' | 'lbw' | 'run_out' | 'stumped' | 'hit_wicket' | 'obstructing_field' | 'retired' | 'retired_hurt' | 'retired_out';
   public dismissed_player_id?: number;
   public extras!: number;
+  public extra_type?: 'bye' | 'leg_bye' | 'wide' | 'no_ball';
+  public next_striker_id?: number;
 }
 
 Ball.init(
@@ -42,11 +46,13 @@ Ball.init(
     is_noball: { type: DataTypes.BOOLEAN, defaultValue: false },
     is_wicket: { type: DataTypes.BOOLEAN, defaultValue: false },
     wicket_type: {
-      type: DataTypes.ENUM('bowled', 'caught', 'lbw', 'run_out', 'stumped', 'hit_wicket', 'obstructing_field', 'retired'),
+      type: DataTypes.ENUM('bowled', 'caught', 'lbw', 'run_out', 'stumped', 'hit_wicket', 'obstructing_field', 'retired', 'retired_hurt', 'retired_out'),
       allowNull: true,
     },
     dismissed_player_id: { type: DataTypes.INTEGER, allowNull: true },
     extras: { type: DataTypes.INTEGER, defaultValue: 0 },
+    extra_type: { type: DataTypes.ENUM('bye', 'leg_bye', 'wide', 'no_ball'), allowNull: true },
+    next_striker_id: { type: DataTypes.INTEGER, allowNull: true },
   },
   {
     sequelize,

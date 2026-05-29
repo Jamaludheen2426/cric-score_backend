@@ -146,7 +146,7 @@ export async function getLiveScore(shareToken: string) {
   // additional N+1 trips. ~120-260 rows per innings even at 50 overs.
   const inningsIds = allInnings.map(i => i.id);
   const allBallRows = inningsIds.length > 0 ? await Ball.findAll({
-    attributes: ['id', 'over_id', 'ball_number', 'batsman_player_id', 'runs', 'is_wide', 'is_noball', 'is_wicket', 'wicket_type', 'dismissed_player_id', 'extras'],
+    attributes: ['id', 'over_id', 'ball_number', 'batsman_player_id', 'runs', 'is_wide', 'is_noball', 'is_wicket', 'wicket_type', 'dismissed_player_id', 'extras', 'extra_type', 'next_striker_id'],
     include: [{
       model: Over,
       as: 'over',
@@ -191,6 +191,7 @@ export async function getLiveScore(shareToken: string) {
   // Current over balls
   let currentOverBalls: any[] = [];
   let currentOver: any = null;
+  let previousOvers: any[] = [];
 
   if (currentInnings) {
     currentOver = await Over.findOne({
@@ -206,15 +207,51 @@ export async function getLiveScore(shareToken: string) {
         order: [['ball_number', 'ASC']],
       });
       currentOverBalls = balls.map(b => ({
+        id: b.id,
         runs: b.runs,
         is_wide: b.is_wide,
         is_noball: b.is_noball,
         is_wicket: b.is_wicket,
         wicket_type: b.wicket_type,
         extras: b.extras,
+        extra_type: b.extra_type,
+        next_striker_id: b.next_striker_id,
         batsman: (b as any).batsman?.name,
       }));
     }
+
+    const overRows = await Over.findAll({
+      where: { innings_id: currentInnings.id },
+      include: [{ model: Player, as: 'bowler' }],
+      order: [['over_number', 'ASC']],
+    });
+    const ballsByOver = new Map<number, any[]>();
+    for (const b of ballsByInnings.get(currentInnings.id) || []) {
+      const arr = ballsByOver.get(b.over_id) || [];
+      arr.push(b);
+      ballsByOver.set(b.over_id, arr);
+    }
+    previousOvers = overRows
+      .filter(o => o.id !== currentOver?.id && ((ballsByOver.get(o.id) || []).length > 0))
+      .map(o => ({
+        id: o.id,
+        over_number: o.over_number,
+        bowler: (o as any).bowler,
+        runs: o.runs,
+        wickets: o.wickets,
+        legal_balls: o.legal_balls,
+        balls: (ballsByOver.get(o.id) || []).map(b => ({
+          id: b.id,
+          runs: b.runs,
+          is_wide: b.is_wide,
+          is_noball: b.is_noball,
+          is_wicket: b.is_wicket,
+          wicket_type: b.wicket_type,
+          extras: b.extras,
+          extra_type: b.extra_type,
+          next_striker_id: b.next_striker_id,
+        })),
+      }));
   }
 
   // Recent balls (last 12 legal balls across overs)
@@ -228,12 +265,15 @@ export async function getLiveScore(shareToken: string) {
     for (const o of recentOvers) {
       const balls = await Ball.findAll({ where: { over_id: o.id }, order: [['ball_number', 'DESC']], limit: 6 });
       recentBalls.push(...balls.map(b => ({
+        id: b.id,
         runs: b.runs,
         is_wide: b.is_wide,
         is_noball: b.is_noball,
-        is_wicket: b.is_wicket,
-        extras: b.extras,
-      })));
+          is_wicket: b.is_wicket,
+          extras: b.extras,
+          extra_type: b.extra_type,
+          next_striker_id: b.next_striker_id,
+        })));
     }
     recentBalls = recentBalls.slice(0, 12).reverse();
   }
@@ -322,5 +362,6 @@ export async function getLiveScore(shareToken: string) {
     } : null,
     currentOverBalls,
     recentBalls,
+    previousOvers,
   };
 }

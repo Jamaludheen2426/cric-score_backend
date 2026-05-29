@@ -10,6 +10,7 @@ import BattingCard from './BattingCard';
 import BowlingCard from './BowlingCard';
 import Tournament from './Tournament';
 import TournamentTeam from './TournamentTeam';
+import ScoreAuditLog from './ScoreAuditLog';
 
 // Team → Players
 Team.hasMany(Player, { foreignKey: 'team_id', as: 'players' });
@@ -30,6 +31,8 @@ TournamentTeam.belongsTo(Team, { foreignKey: 'team_id', as: 'team' });
 // Match → Sessions
 Match.hasMany(MatchSession, { foreignKey: 'match_id', as: 'sessions' });
 MatchSession.belongsTo(Match, { foreignKey: 'match_id', as: 'match' });
+Match.hasMany(ScoreAuditLog, { foreignKey: 'match_id', as: 'auditLogs' });
+ScoreAuditLog.belongsTo(Match, { foreignKey: 'match_id', as: 'match' });
 
 // Match → Innings
 Match.hasMany(Innings, { foreignKey: 'match_id', as: 'innings' });
@@ -88,4 +91,5 @@ export {
   BowlingCard,
   Tournament,
   TournamentTeam,
+  ScoreAuditLog,
 };

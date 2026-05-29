@@ -21,6 +21,7 @@ import { rawPool } from '../config/db-raw';
 import { Match, Innings, Over } from '../models';
 import { broadcastToMatch } from '../middleware/sse';
 import { getLiveScore } from './live.service';
+import { widePenaltyRuns } from './wide-rule';
 
 export interface BallInput {
   runs: number;
@@ -31,9 +32,11 @@ export interface BallInput {
   dismissed_player_id?: number;
   new_batsman_id?: number;
   extras?: number;
+  extra_type?: 'bye' | 'leg_bye' | 'wide' | 'no_ball';
+  next_striker_id?: number;
 }
 
-const WICKET_TYPES_ALLOWED_ON_NO_BALL = new Set(['run_out', 'obstructing_field', 'retired']);
+const WICKET_TYPES_ALLOWED_ON_NO_BALL = new Set(['run_out', 'obstructing_field', 'retired', 'retired_hurt', 'retired_out']);
 
 function broadcastInBackground(shareToken: string) {
   setImmediate(async () => {
@@ -141,10 +144,15 @@ export async function addBall(matchId: number, input: BallInput) {
       };
     }
 
+    const retiredHurt = Boolean(input.is_wicket && input.wicket_type === 'retired_hurt');
     const countsAsWicket = input.is_wicket
-      ? (!input.is_noball || WICKET_TYPES_ALLOWED_ON_NO_BALL.has(input.wicket_type || ''))
+      ? (input.wicket_type === 'retired_hurt'
+          ? false
+          : input.wicket_type === 'retired_out'
+            ? true
+            : (!input.is_noball || WICKET_TYPES_ALLOWED_ON_NO_BALL.has(input.wicket_type || '')))
       : false;
-    if (input.is_wicket && !countsAsWicket) {
+    if (input.is_wicket && !countsAsWicket && !retiredHurt) {
       throw new Error('This wicket type is not valid on a no-ball');
     }
 
@@ -157,22 +165,29 @@ export async function addBall(matchId: number, input: BallInput) {
     if (countsAsWicket && !input.new_batsman_id && !noReplacementAvailable) {
       throw new Error('New batsman is required before scoring the next ball');
     }
+    if (retiredHurt && !input.new_batsman_id) {
+      throw new Error('New batsman is required for retired hurt');
+    }
 
     const isLegal = !input.is_wide && !input.is_noball;
-    const inDeath = match.death_overs_from != null && over.over_number >= match.death_overs_from;
+    const isByeLike = input.extra_type === 'bye' || input.extra_type === 'leg_bye';
     // Local-tournament wide rule:
     //   • Normal over wide: NO penalty run, just re-bowled (ball not counted).
     //   • Death over wide:  +1 penalty + re-bowled.
     //   • Strict (T20):     +1 penalty + re-bowled (regardless of death).
     // Running runs on a wide always count.
-    const widePenalty = input.is_wide && (inDeath || match.wide_rule === 'strict') ? 1 : 0;
+    const widePenalty = input.is_wide ? widePenaltyRuns(match, over) : 0;
     const noBallPenalty = input.is_noball ? 1 : 0;
     const ballExtras = widePenalty + noBallPenalty;
-    const batRuns = input.is_wide ? 0 : input.runs;
+    const batRuns = input.is_wide || isByeLike ? 0 : input.runs;
     const totalExtras = input.is_wide
       ? input.runs + widePenalty                    // running on the wide + the (sometimes zero) wide penalty
+      : isByeLike
+        ? input.runs + noBallPenalty
       : (input.extras || 0) + ballExtras;
     const runsThisBall = batRuns + totalExtras;
+    const bowlerRunsThisBall = isByeLike ? noBallPenalty : runsThisBall;
+    const strikeRuns = isByeLike ? input.runs : batRuns;
     const ball_number = existingBalls + 1;
 
     const isStrikerOut = countsAsWicket && (input.dismissed_player_id === strikerId || !input.dismissed_player_id);
@@ -192,7 +207,7 @@ export async function addBall(matchId: number, input: BallInput) {
 
     // Strike rotation — only on legal, non-wicket, odd-runs deliveries.
     let newOnStrike = innings.on_strike_batsman_id;
-    if (isLegal && !countsAsWicket && batRuns % 2 === 1) {
+    if (isLegal && !countsAsWicket && !retiredHurt && strikeRuns % 2 === 1) {
       newOnStrike = newOnStrike === innings.current_batsman1_id
         ? innings.current_batsman2_id
         : innings.current_batsman1_id;
@@ -210,7 +225,7 @@ export async function addBall(matchId: number, input: BallInput) {
 
     // Bowling card update
     const bc = bowlingCard;
-    const newBwlRuns    = bc ? bc.runs        + runsThisBall                                         : 0;
+    const newBwlRuns    = bc ? bc.runs        + bowlerRunsThisBall                                   : 0;
     const newBwlWickets = bc ? bc.wickets     + (countsAsWicket && input.wicket_type !== 'run_out' ? 1 : 0) : 0;
     const newBwlExtras  = bc ? bc.extras      + totalExtras                                          : 0;
     const newBwlLegal   = bc ? bc.legal_balls + (isLegal ? 1 : 0)                                    : 0;
@@ -220,7 +235,7 @@ export async function addBall(matchId: number, input: BallInput) {
     let inningsBatsman1 = innings.current_batsman1_id;
     let inningsBatsman2 = innings.current_batsman2_id;
     let inningsOnStrike = newOnStrike;
-    if (countsAsWicket && input.new_batsman_id) {
+    if ((countsAsWicket || retiredHurt) && input.new_batsman_id) {
       if (battingCardCount >= maxBatters) {
         throw new Error('No batting slots remain for a new batsman');
       }
@@ -233,6 +248,9 @@ export async function addBall(matchId: number, input: BallInput) {
         inningsBatsman2 = input.new_batsman_id;
         if (dismissedId === innings.on_strike_batsman_id) inningsOnStrike = input.new_batsman_id;
       }
+      if (input.next_striker_id && [inningsBatsman1, inningsBatsman2].includes(input.next_striker_id)) {
+        inningsOnStrike = input.next_striker_id;
+      }
     }
 
     // ── ROUND-TRIP 2 ── One transaction packet with all writes ──────────
@@ -244,8 +262,8 @@ export async function addBall(matchId: number, input: BallInput) {
 
     writes.push(
       `INSERT INTO balls
-        (over_id, ball_number, batsman_player_id, runs, is_wide, is_noball, is_wicket, wicket_type, dismissed_player_id, extras)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        (over_id, ball_number, batsman_player_id, runs, is_wide, is_noball, is_wicket, wicket_type, dismissed_player_id, extras, extra_type, next_striker_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     params.push(
       over.id, ball_number, strikerId, batRuns,
@@ -255,6 +273,8 @@ export async function addBall(matchId: number, input: BallInput) {
       input.wicket_type || null,
       input.dismissed_player_id ?? null,
       totalExtras,
+      input.is_wide ? 'wide' : input.is_noball ? 'no_ball' : input.extra_type || null,
+      input.next_striker_id ?? null,
     );
 
     writes.push(`UPDATE overs SET runs = ?, wickets = ?, extras = ?, legal_balls = ? WHERE id = ?`);
@@ -275,10 +295,13 @@ export async function addBall(matchId: number, input: BallInput) {
       writes.push(`UPDATE batting_cards SET is_out = TRUE, dismissal_type = 'run_out' WHERE id = ?`);
       params.push(nonStrikerCard.id);
     }
-    if (countsAsWicket && input.new_batsman_id) {
+    if ((countsAsWicket || retiredHurt) && input.new_batsman_id) {
       writes.push(`INSERT INTO batting_cards (innings_id, player_id, batting_position) VALUES (?, ?, ?)`);
       params.push(innings.id, input.new_batsman_id, battingCardCount + 1);
     }
+
+    writes.push(`INSERT INTO score_audit_logs (match_id, action, details) VALUES (?, 'ball_added', ?)`);
+    params.push(matchId, JSON.stringify({ input }));
 
     writes.push('COMMIT');
     const writeSql = writes.join(';\n') + ';';
