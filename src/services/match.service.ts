@@ -33,13 +33,14 @@ export async function createMatch(data: {
   team_a_id: number;
   team_b_id: number;
   total_overs: number;
+  balls_per_over?: number;
   players_per_side: number;
   death_overs_from?: number;
   wide_rule: 'normal' | 'strict';
   scorer_pin: string;
 }) {
   const share_token = uuidv4().replace(/-/g, '');
-  return Match.create({ ...data, share_token, status: 'pending' });
+  return Match.create({ ...data, balls_per_over: data.balls_per_over || 6, share_token, status: 'pending' });
 }
 
 export async function verifyPin(matchId: number, pin: string) {

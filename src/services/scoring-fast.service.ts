@@ -22,6 +22,7 @@ import { Match, Innings, Over } from '../models';
 import { broadcastToMatch } from '../middleware/sse';
 import { getLiveScore } from './live.service';
 import { widePenaltyRuns } from './wide-rule';
+import { ballsPerOver, ballsToOversFloat, overProgressToBalls } from './over-utils';
 
 export interface BallInput {
   runs: number;
@@ -74,7 +75,7 @@ export async function addBall(matchId: number, input: BallInput) {
     const readSql = `
       SET @innings_id := (SELECT id FROM innings WHERE match_id = ? AND status = 'live' ORDER BY innings_number DESC LIMIT 1);
       SET @over_id    := (SELECT id FROM overs   WHERE innings_id = @innings_id AND status = 'live' ORDER BY over_number DESC LIMIT 1);
-      SELECT id, status, total_overs, players_per_side, wide_rule, death_overs_from, share_token, team_a_id, team_b_id
+      SELECT id, status, total_overs, balls_per_over, players_per_side, wide_rule, death_overs_from, share_token, team_a_id, team_b_id
         FROM matches WHERE id = ?;
       SELECT id, batting_team_id, bowling_team_id, innings_number, status, total_runs, total_wickets,
              total_overs_bowled, extras, target, current_batsman1_id, current_batsman2_id,
@@ -96,6 +97,8 @@ export async function addBall(matchId: number, input: BallInput) {
         WHERE team_id = (SELECT batting_team_id FROM innings WHERE id = @innings_id);
       SELECT id, is_out FROM batting_cards
         WHERE innings_id = @innings_id AND player_id = ?;
+      SELECT id, is_wide, is_noball, is_free_hit FROM balls
+        WHERE over_id = @over_id ORDER BY ball_number DESC LIMIT 1;
     `;
     const [results] = await conn.query(readSql, [
       matchId,
@@ -116,6 +119,7 @@ export async function addBall(matchId: number, input: BallInput) {
       battingCardCountRows,
       playerCountRows,
       nonStrikerCardRows,
+      lastBallRows,
     ] = sets;
 
     const match     = matchRows?.[0];
@@ -127,6 +131,7 @@ export async function addBall(matchId: number, input: BallInput) {
     const battingCardCount    = battingCardCountRows?.[0]?.cnt ?? 0;
     const rosterCount         = playerCountRows?.[0]?.cnt ?? 0;
     const nonStrikerCard      = nonStrikerCardRows?.[0];
+    const lastBall            = lastBallRows?.[0];
 
     if (!match)   throw new Error('Match not found');
     if (match.status !== 'live') throw new Error('Match is not live');
@@ -144,16 +149,18 @@ export async function addBall(matchId: number, input: BallInput) {
       };
     }
 
+    const perOver = ballsPerOver(match);
+    const isFreeHit = Boolean(lastBall?.is_noball || (lastBall?.is_free_hit && (lastBall.is_wide || lastBall.is_noball)));
     const retiredHurt = Boolean(input.is_wicket && input.wicket_type === 'retired_hurt');
     const countsAsWicket = input.is_wicket
       ? (input.wicket_type === 'retired_hurt'
           ? false
           : input.wicket_type === 'retired_out'
             ? true
-            : (!input.is_noball || WICKET_TYPES_ALLOWED_ON_NO_BALL.has(input.wicket_type || '')))
+            : ((!input.is_noball && !isFreeHit) || WICKET_TYPES_ALLOWED_ON_NO_BALL.has(input.wicket_type || '')))
       : false;
     if (input.is_wicket && !countsAsWicket && !retiredHurt) {
-      throw new Error('This wicket type is not valid on a no-ball');
+      throw new Error(isFreeHit ? 'This wicket type is not valid on a free hit' : 'This wicket type is not valid on a no-ball');
     }
 
     const configuredCount = Number(match.players_per_side) || rosterCount || 11;
@@ -202,8 +209,8 @@ export async function addBall(matchId: number, input: BallInput) {
     const newInnRuns     = innings.total_runs    + runsThisBall;
     const newInnWickets  = innings.total_wickets + (countsAsWicket ? 1 : 0);
     const newInnExtras   = innings.extras        + totalExtras;
-    const totalLegalBalls = (over.over_number - 1) * 6 + newOverLegal;
-    const newInnOversBowled = Math.floor(totalLegalBalls / 6) + (totalLegalBalls % 6) / 10;
+    const totalLegalBalls = overProgressToBalls(over.over_number, newOverLegal, perOver);
+    const newInnOversBowled = ballsToOversFloat(totalLegalBalls, perOver);
 
     // Strike rotation — only on legal, non-wicket, odd-runs deliveries.
     let newOnStrike = innings.on_strike_batsman_id;
@@ -229,7 +236,7 @@ export async function addBall(matchId: number, input: BallInput) {
     const newBwlWickets = bc ? bc.wickets     + (countsAsWicket && input.wicket_type !== 'run_out' ? 1 : 0) : 0;
     const newBwlExtras  = bc ? bc.extras      + totalExtras                                          : 0;
     const newBwlLegal   = bc ? bc.legal_balls + (isLegal ? 1 : 0)                                    : 0;
-    const newBwlOvers   = Math.floor(newBwlLegal / 6) + (newBwlLegal % 6) / 10;
+    const newBwlOvers   = ballsToOversFloat(newBwlLegal, perOver);
 
     // New-batsman handling — figure out which slot the dismissed player held.
     let inningsBatsman1 = innings.current_batsman1_id;
@@ -262,8 +269,8 @@ export async function addBall(matchId: number, input: BallInput) {
 
     writes.push(
       `INSERT INTO balls
-        (over_id, ball_number, batsman_player_id, runs, is_wide, is_noball, is_wicket, wicket_type, dismissed_player_id, extras, extra_type, next_striker_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        (over_id, ball_number, batsman_player_id, runs, is_wide, is_noball, is_wicket, wicket_type, dismissed_player_id, extras, extra_type, next_striker_id, new_batsman_id, is_free_hit)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     params.push(
       over.id, ball_number, strikerId, batRuns,
@@ -275,6 +282,8 @@ export async function addBall(matchId: number, input: BallInput) {
       totalExtras,
       input.is_wide ? 'wide' : input.is_noball ? 'no_ball' : input.extra_type || null,
       input.next_striker_id ?? null,
+      input.new_batsman_id ?? null,
+      isFreeHit ? 1 : 0,
     );
 
     writes.push(`UPDATE overs SET runs = ?, wickets = ?, extras = ?, legal_balls = ? WHERE id = ?`);
@@ -319,13 +328,13 @@ export async function addBall(matchId: number, input: BallInput) {
 
     // ── End-of-innings checks (data already mutated above) ────────────────
     const allOut = Boolean(countsAsWicket && !input.new_batsman_id && noReplacementAvailable);
-    const oversFinished = newInnOversBowled >= match.total_overs;
+    const oversFinished = totalLegalBalls >= Number(match.total_overs) * perOver;
     const targetReached = innings.innings_number === 2 && innings.target != null && newInnRuns >= innings.target;
 
     if (allOut || oversFinished || targetReached) {
       await completeInningsFallback(matchId, innings.id, over.id, innings.innings_number === 2);
       return {
-        ball: { id: ballInsertId, runs: batRuns, is_wide: !!input.is_wide, is_noball: !!input.is_noball, is_wicket: countsAsWicket, extras: totalExtras },
+        ball: { id: ballInsertId, runs: batRuns, is_wide: !!input.is_wide, is_noball: !!input.is_noball, is_wicket: countsAsWicket, extras: totalExtras, is_free_hit: isFreeHit },
         allOut,
         oversFinished,
         targetReached,
@@ -336,7 +345,7 @@ export async function addBall(matchId: number, input: BallInput) {
     broadcastInBackground(match.share_token);
 
     return {
-      ball: { id: ballInsertId, runs: batRuns, is_wide: !!input.is_wide, is_noball: !!input.is_noball, is_wicket: countsAsWicket, extras: totalExtras },
+      ball: { id: ballInsertId, runs: batRuns, is_wide: !!input.is_wide, is_noball: !!input.is_noball, is_wicket: countsAsWicket, extras: totalExtras, is_free_hit: isFreeHit },
     };
   } finally {
     conn.release();

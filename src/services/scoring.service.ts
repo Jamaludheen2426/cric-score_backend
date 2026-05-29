@@ -3,6 +3,7 @@ import { ScoreAuditLog } from '../models';
 import { broadcastToMatch } from '../middleware/sse';
 import { getLiveScore } from './live.service';
 import { widePenaltyRuns } from './wide-rule';
+import { ballsPerOver, ballsToOversFloat, overProgressToBalls } from './over-utils';
 
 /**
  * Fire-and-forget SSE broadcast. We DON'T await this so the API request can
@@ -41,11 +42,11 @@ async function completeInnings(match: Match, innings: Innings, over: Over) {
   }
   broadcastInBackground(match.share_token);
 }
-async function recalcInningsOvers(inningsId: number, innings: Innings) {
+async function recalcInningsOvers(inningsId: number, innings: Innings, perOver = 6) {
   const allOvers = await Over.findAll({ where: { innings_id: inningsId } });
   let total = 0;
   for (const o of allOvers) total += o.legal_balls;
-  const inningsOvers = Math.floor(total / 6) + (total % 6) / 10;
+  const inningsOvers = ballsToOversFloat(total, perOver);
   await innings.update({ total_overs_bowled: inningsOvers });
 }
 
@@ -64,11 +65,11 @@ export interface BallInput {
 
 const WICKET_TYPES_ALLOWED_ON_NO_BALL = new Set(['run_out', 'obstructing_field', 'retired', 'retired_hurt', 'retired_out']);
 
-function wicketCounts(input: BallInput) {
+function wicketCounts(input: BallInput, isFreeHit = false) {
   if (!input.is_wicket) return false;
   if (input.wicket_type === 'retired_hurt') return false;
   if (input.wicket_type === 'retired_out') return true;
-  if (!input.is_noball) return true;
+  if (!input.is_noball && !isFreeHit) return true;
   return WICKET_TYPES_ALLOWED_ON_NO_BALL.has(input.wicket_type || '');
 }
 
@@ -105,11 +106,17 @@ export async function addBall(matchId: number, input: BallInput) {
   });
   if (!over) throw new Error('No active over');
 
+  const perOver = ballsPerOver(match);
+  const lastBall = await Ball.findOne({
+    where: { over_id: over.id },
+    order: [['ball_number', 'DESC']],
+  });
+  const isFreeHit = Boolean(lastBall?.is_noball || (lastBall?.is_free_hit && (lastBall.is_wide || lastBall.is_noball)));
   const strikerId = innings.on_strike_batsman_id!;
-  const countsAsWicket = wicketCounts(input);
+  const countsAsWicket = wicketCounts(input, isFreeHit);
   const retiredHurt = isRetiredHurt(input);
   if (input.is_wicket && !countsAsWicket && !retiredHurt) {
-    throw new Error('This wicket type is not valid on a no-ball');
+    throw new Error(isFreeHit ? 'This wicket type is not valid on a free hit' : 'This wicket type is not valid on a no-ball');
   }
 
   // These three lookups are independent — fire them in parallel to
@@ -177,7 +184,7 @@ export async function addBall(matchId: number, input: BallInput) {
   // Create ball + apply all stat updates in parallel.
   const isOut = countsAsWicket && (input.dismissed_player_id === strikerId || !input.dismissed_player_id);
   const newLegalBowlerBalls = (bowlingCard?.legal_balls || 0) + (isLegal ? 1 : 0);
-  const newBowlerOversFloat = Math.floor(newLegalBowlerBalls / 6) + (newLegalBowlerBalls % 6) / 10;
+  const newBowlerOversFloat = ballsToOversFloat(newLegalBowlerBalls, perOver);
 
   const [ball] = await Promise.all([
     Ball.create({
@@ -193,6 +200,8 @@ export async function addBall(matchId: number, input: BallInput) {
       extras: totalExtras,
       extra_type: input.is_wide ? 'wide' : input.is_noball ? 'no_ball' : input.extra_type,
       next_striker_id: input.next_striker_id,
+      new_batsman_id: input.new_batsman_id,
+      is_free_hit: isFreeHit,
     }),
     over.update({
       runs: over.runs + runsThisBall,
@@ -271,11 +280,10 @@ export async function addBall(matchId: number, input: BallInput) {
   // plus all completed overs already on this innings — we already know
   // legal_balls per over from in-memory state, but for completed overs
   // we'd need a sum. Approximate without a query: every completed over
-  // has 6 legal balls, so completed_overs = over.over_number - 1.
-  //   total_legal = (over.over_number - 1) * 6 + over.legal_balls
+  // has match.balls_per_over legal balls, so completed_overs = over.over_number - 1.
   const newOverLegalBalls = over.legal_balls;   // already mutated by the .update above
-  const totalLegalBalls = (over.over_number - 1) * 6 + newOverLegalBalls;
-  const newTotalOversBowled = Math.floor(totalLegalBalls / 6) + (totalLegalBalls % 6) / 10;
+  const totalLegalBalls = overProgressToBalls(over.over_number, newOverLegalBalls, perOver);
+  const newTotalOversBowled = ballsToOversFloat(totalLegalBalls, perOver);
 
   const inningsPatch: Partial<{ on_strike_batsman_id: number; total_overs_bowled: number }> = {
     total_overs_bowled: newTotalOversBowled,
@@ -289,7 +297,7 @@ export async function addBall(matchId: number, input: BallInput) {
 
   // ── End-of-innings / end-of-match checks ──────────────────────────
   const allOut = Boolean(countsAsWicket && !input.new_batsman_id && noReplacementAvailable);
-  const oversFinished = Number(innings.total_overs_bowled) >= match.total_overs;
+  const oversFinished = totalLegalBalls >= Number(match.total_overs) * perOver;
   const targetReached = innings.innings_number === 2 && innings.target != null && innings.total_runs >= innings.target;
 
   if (allOut || oversFinished || targetReached) {
@@ -327,7 +335,8 @@ export async function endOver(matchId: number, nextBowlerId: number) {
     order: [['over_number', 'DESC']],
   });
   if (!over) throw new Error('No active over');
-  if (over.legal_balls < 6) throw new Error('Over is not complete');
+  const perOver = ballsPerOver(match);
+  if (over.legal_balls < perOver) throw new Error('Over is not complete');
   if (nextBowlerId === over.bowler_player_id) throw new Error('Same bowler cannot bowl consecutive overs');
 
   const nextBowler = await Player.findOne({ where: { id: nextBowlerId, team_id: innings.bowling_team_id } });
@@ -617,7 +626,8 @@ export async function undoLastBall(matchId: number) {
   const bowlingCard = await BowlingCard.findOne({ where: { innings_id: innings.id, player_id: over.bowler_player_id } });
   if (bowlingCard) {
     const newLegalBalls = bowlingCard.legal_balls - (isLegal ? 1 : 0);
-    const oversFloat = Math.floor(newLegalBalls / 6) + (newLegalBalls % 6) / 10;
+    const perOver = ballsPerOver(match);
+    const oversFloat = ballsToOversFloat(newLegalBalls, perOver);
     await bowlingCard.update({
       runs: bowlingCard.runs - bowlerRunsThisBall,
       wickets: bowlingCard.wickets - (lastBall.is_wicket && lastBall.wicket_type !== 'run_out' ? 1 : 0),
@@ -652,7 +662,7 @@ export async function undoLastBall(matchId: number) {
   }
 
   await innings.update(inningsUpdate);
-  await recalcInningsOvers(innings.id, innings);
+  await recalcInningsOvers(innings.id, innings, ballsPerOver(match));
 
   // Delete the ball
   await lastBall.destroy();

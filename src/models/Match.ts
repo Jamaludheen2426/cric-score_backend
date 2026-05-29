@@ -8,6 +8,7 @@ export interface MatchAttributes {
   team_b_id: number;
   tournament_id?: number;
   total_overs: number;
+  balls_per_over: number;
   players_per_side: number;
   death_overs_from?: number;
   wide_rule: 'normal' | 'strict';
@@ -19,7 +20,7 @@ export interface MatchAttributes {
   created_at?: Date;
 }
 
-export interface MatchCreationAttributes extends Optional<MatchAttributes, 'id' | 'status'> {}
+export interface MatchCreationAttributes extends Optional<MatchAttributes, 'id' | 'status' | 'balls_per_over'> {}
 
 class Match extends Model<MatchAttributes, MatchCreationAttributes> implements MatchAttributes {
   public id!: number;
@@ -28,6 +29,7 @@ class Match extends Model<MatchAttributes, MatchCreationAttributes> implements M
   public team_b_id!: number;
   public tournament_id?: number;
   public total_overs!: number;
+  public balls_per_over!: number;
   public players_per_side!: number;
   public death_overs_from?: number;
   public wide_rule!: 'normal' | 'strict';
@@ -47,6 +49,7 @@ Match.init(
     team_b_id: { type: DataTypes.INTEGER, allowNull: false, references: { model: 'teams', key: 'id' } },
     tournament_id: { type: DataTypes.INTEGER, allowNull: true, references: { model: 'tournaments', key: 'id' } },
     total_overs: { type: DataTypes.INTEGER, allowNull: false },
+    balls_per_over: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 6 },
     players_per_side: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 11 },
     death_overs_from: { type: DataTypes.INTEGER, allowNull: true },
     wide_rule: { type: DataTypes.ENUM('normal', 'strict'), defaultValue: 'normal' },

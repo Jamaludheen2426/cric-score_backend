@@ -15,9 +15,11 @@ export interface BallAttributes {
   extras: number;
   extra_type?: 'bye' | 'leg_bye' | 'wide' | 'no_ball';
   next_striker_id?: number;
+  new_batsman_id?: number;
+  is_free_hit: boolean;
 }
 
-export interface BallCreationAttributes extends Optional<BallAttributes, 'id' | 'is_wide' | 'is_noball' | 'is_wicket' | 'extras'> {}
+export interface BallCreationAttributes extends Optional<BallAttributes, 'id' | 'is_wide' | 'is_noball' | 'is_wicket' | 'extras' | 'is_free_hit'> {}
 
 class Ball extends Model<BallAttributes, BallCreationAttributes> implements BallAttributes {
   public id!: number;
@@ -33,6 +35,8 @@ class Ball extends Model<BallAttributes, BallCreationAttributes> implements Ball
   public extras!: number;
   public extra_type?: 'bye' | 'leg_bye' | 'wide' | 'no_ball';
   public next_striker_id?: number;
+  public new_batsman_id?: number;
+  public is_free_hit!: boolean;
 }
 
 Ball.init(
@@ -53,6 +57,8 @@ Ball.init(
     extras: { type: DataTypes.INTEGER, defaultValue: 0 },
     extra_type: { type: DataTypes.ENUM('bye', 'leg_bye', 'wide', 'no_ball'), allowNull: true },
     next_striker_id: { type: DataTypes.INTEGER, allowNull: true },
+    new_batsman_id: { type: DataTypes.INTEGER, allowNull: true },
+    is_free_hit: { type: DataTypes.BOOLEAN, defaultValue: false },
   },
   {
     sequelize,

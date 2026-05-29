@@ -1,4 +1,5 @@
 import { Match, Innings, Over, Ball, BattingCard, BowlingCard, Player, Team } from '../models';
+import { ballsPerOver } from './over-utils';
 
 /**
  * Compute partnerships and fall-of-wickets for a single innings by
@@ -14,7 +15,7 @@ import { Match, Innings, Over, Ball, BattingCard, BowlingCard, Player, Team } fr
  *   For each wicket ball, record the team score and over notation at the
  *   moment the wicket fell, plus who got out.
  */
-function computeNarratives(innings: any, ballRows: any[]) {
+function computeNarratives(innings: any, ballRows: any[], perOver = 6) {
   const sortedCards = (innings.battingCards || [])
     .slice()
     .sort((a: any, b: any) => a.batting_position - b.batting_position);
@@ -37,8 +38,8 @@ function computeNarratives(innings: any, ballRows: any[]) {
   const fallOfWickets: any[] = [];
 
   const oversNotation = () => {
-    const ov = Math.floor(runningLegalBalls / 6);
-    const b = runningLegalBalls % 6;
+    const ov = Math.floor(runningLegalBalls / perOver);
+    const b = runningLegalBalls % perOver;
     return `${ov}.${b}`;
   };
 
@@ -112,6 +113,7 @@ export async function getLiveScore(shareToken: string) {
   });
 
   if (!match) throw new Error('Match not found');
+  const perOver = ballsPerOver(match);
 
   const allInnings = await Innings.findAll({
     where: { match_id: match.id },
@@ -146,7 +148,7 @@ export async function getLiveScore(shareToken: string) {
   // additional N+1 trips. ~120-260 rows per innings even at 50 overs.
   const inningsIds = allInnings.map(i => i.id);
   const allBallRows = inningsIds.length > 0 ? await Ball.findAll({
-    attributes: ['id', 'over_id', 'ball_number', 'batsman_player_id', 'runs', 'is_wide', 'is_noball', 'is_wicket', 'wicket_type', 'dismissed_player_id', 'extras', 'extra_type', 'next_striker_id'],
+    attributes: ['id', 'over_id', 'ball_number', 'batsman_player_id', 'runs', 'is_wide', 'is_noball', 'is_wicket', 'wicket_type', 'dismissed_player_id', 'extras', 'extra_type', 'next_striker_id', 'new_batsman_id', 'is_free_hit'],
     include: [{
       model: Over,
       as: 'over',
@@ -175,7 +177,7 @@ export async function getLiveScore(shareToken: string) {
   const bowlerExtras = new Map<string, { wides: number; noballs: number }>();
   for (const inn of allInnings) {
     const balls = ballsByInnings.get(inn.id) || [];
-    narrativesByInnings.set(inn.id, computeNarratives(inn, balls));
+    narrativesByInnings.set(inn.id, computeNarratives(inn, balls, perOver));
     for (const b of balls as any[]) {
       if (!b.is_wide && !b.is_noball) continue;
       const bowlerId = b.over?.bowler_player_id;
@@ -186,6 +188,48 @@ export async function getLiveScore(shareToken: string) {
       if (b.is_noball) cur.noballs += 1;
       bowlerExtras.set(key, cur);
     }
+  }
+
+  const allOverRows = inningsIds.length > 0 ? await Over.findAll({
+    where: { innings_id: inningsIds },
+    include: [{ model: Player, as: 'bowler' }],
+    order: [['innings_id', 'ASC'], ['over_number', 'ASC']],
+  }) : [];
+
+  const ballJson = (b: any) => ({
+    id: b.id,
+    runs: b.runs,
+    is_wide: b.is_wide,
+    is_noball: b.is_noball,
+    is_wicket: b.is_wicket,
+    wicket_type: b.wicket_type,
+    extras: b.extras,
+    extra_type: b.extra_type,
+    next_striker_id: b.next_striker_id,
+    new_batsman_id: b.new_batsman_id,
+    is_free_hit: b.is_free_hit,
+  });
+
+  const overSummariesByInnings = new Map<number, any[]>();
+  for (const inn of allInnings) {
+    const ballsByOver = new Map<number, any[]>();
+    for (const b of ballsByInnings.get(inn.id) || []) {
+      const arr = ballsByOver.get(b.over_id) || [];
+      arr.push(b);
+      ballsByOver.set(b.over_id, arr);
+    }
+    const rows = (allOverRows as any[])
+      .filter(o => o.innings_id === inn.id && ((ballsByOver.get(o.id) || []).length > 0))
+      .map(o => ({
+        id: o.id,
+        over_number: o.over_number,
+        bowler: o.bowler,
+        runs: o.runs,
+        wickets: o.wickets,
+        legal_balls: o.legal_balls,
+        balls: (ballsByOver.get(o.id) || []).map(ballJson),
+      }));
+    overSummariesByInnings.set(inn.id, rows);
   }
 
   // Current over balls
@@ -216,42 +260,14 @@ export async function getLiveScore(shareToken: string) {
         extras: b.extras,
         extra_type: b.extra_type,
         next_striker_id: b.next_striker_id,
+        new_batsman_id: b.new_batsman_id,
+        is_free_hit: b.is_free_hit,
         batsman: (b as any).batsman?.name,
       }));
     }
 
-    const overRows = await Over.findAll({
-      where: { innings_id: currentInnings.id },
-      include: [{ model: Player, as: 'bowler' }],
-      order: [['over_number', 'ASC']],
-    });
-    const ballsByOver = new Map<number, any[]>();
-    for (const b of ballsByInnings.get(currentInnings.id) || []) {
-      const arr = ballsByOver.get(b.over_id) || [];
-      arr.push(b);
-      ballsByOver.set(b.over_id, arr);
-    }
-    previousOvers = overRows
-      .filter(o => o.id !== currentOver?.id && ((ballsByOver.get(o.id) || []).length > 0))
-      .map(o => ({
-        id: o.id,
-        over_number: o.over_number,
-        bowler: (o as any).bowler,
-        runs: o.runs,
-        wickets: o.wickets,
-        legal_balls: o.legal_balls,
-        balls: (ballsByOver.get(o.id) || []).map(b => ({
-          id: b.id,
-          runs: b.runs,
-          is_wide: b.is_wide,
-          is_noball: b.is_noball,
-          is_wicket: b.is_wicket,
-          wicket_type: b.wicket_type,
-          extras: b.extras,
-          extra_type: b.extra_type,
-          next_striker_id: b.next_striker_id,
-        })),
-      }));
+    previousOvers = (overSummariesByInnings.get(currentInnings.id) || [])
+      .filter(o => o.id !== currentOver?.id);
   }
 
   // Recent balls (last 12 legal balls across overs)
@@ -273,6 +289,8 @@ export async function getLiveScore(shareToken: string) {
           extras: b.extras,
           extra_type: b.extra_type,
           next_striker_id: b.next_striker_id,
+          new_batsman_id: b.new_batsman_id,
+          is_free_hit: b.is_free_hit,
         })));
     }
     recentBalls = recentBalls.slice(0, 12).reverse();
@@ -288,15 +306,15 @@ export async function getLiveScore(shareToken: string) {
     const oversFloat = currentInnings.total_overs_bowled;
     const fullOvers = Math.floor(oversFloat);
     const partialBalls = Math.round((oversFloat - fullOvers) * 10);
-    const totalBalls = fullOvers * 6 + partialBalls;
-    runRate = totalBalls > 0 ? (currentInnings.total_runs / totalBalls) * 6 : 0;
+    const totalBalls = fullOvers * perOver + partialBalls;
+    runRate = totalBalls > 0 ? (currentInnings.total_runs / totalBalls) * perOver : 0;
 
     if (currentInnings.target && currentInnings.innings_number === 2) {
       runsNeeded = Math.max(0, currentInnings.target - currentInnings.total_runs);
-      const totalMatchBalls = match.total_overs * 6;
+      const totalMatchBalls = match.total_overs * perOver;
       const ballsUsed = totalBalls;
       ballsLeft = Math.max(0, totalMatchBalls - ballsUsed);
-      requiredRate = ballsLeft > 0 ? (runsNeeded / ballsLeft) * 6 : 0;
+      requiredRate = ballsLeft > 0 ? (runsNeeded / ballsLeft) * perOver : 0;
     }
   }
 
@@ -306,6 +324,7 @@ export async function getLiveScore(shareToken: string) {
       title: match.title,
       status: match.status,
       total_overs: match.total_overs,
+      balls_per_over: match.balls_per_over,
       players_per_side: match.players_per_side,
       death_overs_from: match.death_overs_from,
       wide_rule: match.wide_rule,
@@ -346,6 +365,7 @@ export async function getLiveScore(shareToken: string) {
         bowlingCards: decoratedBowling,
         partnerships: narr.partnerships,
         fallOfWickets: narr.fallOfWickets,
+        overSummaries: overSummariesByInnings.get(inn.id) || [],
         run_rate: inn === currentInnings ? runRate : null,
         required_rate: inn === currentInnings ? requiredRate : null,
         runs_needed: inn === currentInnings ? runsNeeded : null,
