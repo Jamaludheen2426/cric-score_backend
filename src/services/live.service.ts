@@ -309,9 +309,10 @@ export async function getLiveScore(shareToken: string) {
     const totalBalls = fullOvers * perOver + partialBalls;
     runRate = totalBalls > 0 ? (currentInnings.total_runs / totalBalls) * perOver : 0;
 
-    if (currentInnings.target && currentInnings.innings_number === 2) {
+    if (currentInnings.target) {
       runsNeeded = Math.max(0, currentInnings.target - currentInnings.total_runs);
-      const totalMatchBalls = match.total_overs * perOver;
+      const inningsOversLimit = currentInnings.innings_number > 2 ? 1 : match.total_overs;
+      const totalMatchBalls = inningsOversLimit * perOver;
       const ballsUsed = totalBalls;
       ballsLeft = Math.max(0, totalMatchBalls - ballsUsed);
       requiredRate = ballsLeft > 0 ? (runsNeeded / ballsLeft) * perOver : 0;

@@ -50,7 +50,7 @@ function broadcastInBackground(shareToken: string) {
   });
 }
 
-async function completeInningsFallback(matchId: number, inningsId: number, overId: number, isSecondInnings: boolean) {
+async function completeInningsFallback(matchId: number, inningsId: number, overId: number, inningsNumber: number) {
   // One-off path — not on the per-ball hot path. Use Sequelize for clarity.
   const [match, innings, over] = await Promise.all([
     Match.findByPk(matchId),
@@ -61,8 +61,16 @@ async function completeInningsFallback(matchId: number, inningsId: number, overI
   await Promise.all([
     innings.update({ status: 'completed' }),
     over.update({ status: 'completed' }),
-    isSecondInnings ? match.update({ status: 'completed' }) : Promise.resolve(),
   ]);
+  if (inningsNumber === 2) {
+    const first = await Innings.findOne({ where: { match_id: matchId, innings_number: 1 } });
+    const second = await innings.reload();
+    if (!first || first.total_runs !== second.total_runs) {
+      await match.update({ status: 'completed' });
+    }
+  } else if (inningsNumber >= 4) {
+    await match.update({ status: 'completed' });
+  }
   broadcastInBackground(match.share_token);
 }
 
@@ -152,7 +160,7 @@ export async function addBall(matchId: number, input: BallInput) {
     const strikerId = innings.on_strike_batsman_id;
     if (strikerCard?.is_out) {
       // Defensive: striker already retired/out. Close innings via Sequelize fallback.
-      await completeInningsFallback(matchId, innings.id, over.id, innings.innings_number === 2);
+      await completeInningsFallback(matchId, innings.id, over.id, innings.innings_number);
       return {
         allOut: true,
         matchEnded: innings.innings_number === 2,
@@ -346,17 +354,19 @@ export async function addBall(matchId: number, input: BallInput) {
 
     // ── End-of-innings checks (data already mutated above) ────────────────
     const allOut = Boolean(countsAsWicket && !input.new_batsman_id && noReplacementAvailable);
-    const oversFinished = totalLegalBalls >= Number(match.total_overs) * perOver;
-    const targetReached = innings.innings_number === 2 && innings.target != null && newInnRuns >= innings.target;
+    const inningsOversLimit = innings.innings_number > 2 ? 1 : Number(match.total_overs);
+    const oversFinished = totalLegalBalls >= inningsOversLimit * perOver;
+    const targetReached = innings.target != null && newInnRuns >= innings.target;
+    const tiedSecondInnings = innings.innings_number === 2 && innings.target != null && newInnRuns === innings.target - 1;
 
     if (allOut || oversFinished || targetReached) {
-      await completeInningsFallback(matchId, innings.id, over.id, innings.innings_number === 2);
+      await completeInningsFallback(matchId, innings.id, over.id, innings.innings_number);
       return {
         ball: { id: ballInsertId, runs: batRuns, is_wide: !!input.is_wide, is_noball: !!input.is_noball, is_wicket: countsAsWicket, extras: totalExtras, is_free_hit: isFreeHit },
         allOut,
         oversFinished,
         targetReached,
-        matchEnded: innings.innings_number === 2,
+        matchEnded: innings.innings_number >= 4 || (innings.innings_number === 2 && !tiedSecondInnings),
       };
     }
 

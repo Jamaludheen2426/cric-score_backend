@@ -38,6 +38,12 @@ async function completeInnings(match: Match, innings: Innings, over: Over) {
   await innings.update({ status: 'completed' });
   await over.update({ status: 'completed' });
   if (innings.innings_number === 2) {
+    const first = await Innings.findOne({ where: { match_id: match.id, innings_number: 1 } });
+    const second = await innings.reload();
+    if (!first || first.total_runs !== second.total_runs) {
+      await match.update({ status: 'completed' });
+    }
+  } else if (innings.innings_number >= 4) {
     await match.update({ status: 'completed' });
   }
   broadcastInBackground(match.share_token);
@@ -300,9 +306,12 @@ export async function addBall(matchId: number, input: BallInput) {
   await innings.update(inningsPatch);
 
   // ── End-of-innings / end-of-match checks ──────────────────────────
+  const finalRuns = innings.total_runs + runsThisBall;
   const allOut = Boolean(countsAsWicket && !input.new_batsman_id && noReplacementAvailable);
-  const oversFinished = totalLegalBalls >= Number(match.total_overs) * perOver;
-  const targetReached = innings.innings_number === 2 && innings.target != null && innings.total_runs >= innings.target;
+  const inningsOversLimit = innings.innings_number > 2 ? 1 : Number(match.total_overs);
+  const oversFinished = totalLegalBalls >= inningsOversLimit * perOver;
+  const targetReached = innings.target != null && finalRuns >= innings.target;
+  const tiedSecondInnings = innings.innings_number === 2 && innings.target != null && finalRuns === innings.target - 1;
 
   if (allOut || oversFinished || targetReached) {
     await completeInnings(match, innings, over);
@@ -312,7 +321,7 @@ export async function addBall(matchId: number, input: BallInput) {
       allOut,
       oversFinished,
       targetReached,
-      matchEnded: innings.innings_number === 2,
+      matchEnded: innings.innings_number >= 4 || (innings.innings_number === 2 && !tiedSecondInnings),
     };
   }
 
