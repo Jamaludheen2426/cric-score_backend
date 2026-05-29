@@ -33,7 +33,7 @@ export async function createMatch(req: Request, res: Response) {
 
 export async function verifyPin(req: Request, res: Response) {
   try {
-    const token = await matchService.verifyPin(Number(req.params.id), req.body.pin);
+    const token = await matchService.verifyPin(Number(req.params.id), req.body.pin, Boolean(req.body.force));
     ok(res, { token });
   } catch (e) { err(res, e, 401); }
 }
@@ -89,6 +89,65 @@ export async function exportCsv(req: Request, res: Response) {
   } catch (e) { err(res, e); }
 }
 
+function pdfEscape(value: string) {
+  return value.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
+}
+
+function simplePdf(lines: string[]) {
+  const content = [
+    'BT',
+    '/F1 12 Tf',
+    '50 790 Td',
+    ...lines.flatMap((line, index) => [
+      index === 0 ? '/F1 16 Tf' : '/F1 12 Tf',
+      `(${pdfEscape(line)}) Tj`,
+      '0 -18 Td',
+    ]),
+    'ET',
+  ].join('\n');
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    `<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}\nendstream`,
+  ];
+  let pdf = '%PDF-1.4\n';
+  const offsets = [0];
+  objects.forEach((obj, i) => {
+    offsets.push(Buffer.byteLength(pdf));
+    pdf += `${i + 1} 0 obj\n${obj}\nendobj\n`;
+  });
+  const xref = Buffer.byteLength(pdf);
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  offsets.slice(1).forEach(offset => { pdf += `${String(offset).padStart(10, '0')} 00000 n \n`; });
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return Buffer.from(pdf);
+}
+
+export async function exportPdf(req: Request, res: Response) {
+  try {
+    const match = await matchService.getMatchById(Number(req.params.id));
+    if (!match) return res.status(404).send('Match not found');
+    const live = await liveService.getLiveScore(match.share_token);
+    const lines = [
+      match.title,
+      `${(match as any).teamA?.name || ''} vs ${(match as any).teamB?.name || ''}`,
+      '',
+      ...live.innings.flatMap((innings: any) => [
+        `${innings.battingTeam?.name || 'Innings'} ${innings.total_runs}/${innings.total_wickets} (${innings.total_overs_bowled}/${match.total_overs})`,
+        `Extras ${innings.extras}`,
+        ...(innings.battingCards || []).slice(0, 8).map((card: any) => `${card.player?.name || ''} ${card.runs} (${card.balls})`),
+        '',
+      ]),
+    ];
+    const pdf = simplePdf(lines.slice(0, 44));
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="match-${match.id}-scorecard.pdf"`);
+    res.send(pdf);
+  } catch (e) { err(res, e); }
+}
+
 export async function unlockMatch(req: Request, res: Response) {
   try { ok(res, await matchService.unlockMatch(Number(req.params.id))); } catch (e) { err(res, e); }
 }
@@ -103,6 +162,10 @@ export async function endMatch(req: Request, res: Response) {
 
 export async function undoBall(req: Request, res: Response) {
   try { ok(res, await scoringService.undoLastBall(Number(req.params.id))); } catch (e) { err(res, e); }
+}
+
+export async function editBall(req: Request, res: Response) {
+  try { ok(res, await scoringService.editBall(Number(req.params.id), Number(req.params.ballId), req.body)); } catch (e) { err(res, e); }
 }
 
 export async function liveScore(req: Request, res: Response) {

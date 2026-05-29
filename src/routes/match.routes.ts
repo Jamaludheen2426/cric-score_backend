@@ -15,6 +15,7 @@ router.get('/:id', ctrl.getMatch);
 // Scorer-authenticated scoring endpoints
 router.post('/:id/start', requireScorerAuth, ctrl.startMatch);
 router.post('/:id/ball', requireScorerAuth, ctrl.addBall);
+router.put('/:id/balls/:ballId', requireScorerAuth, ctrl.editBall);
 router.delete('/:id/ball/last', requireScorerAuth, ctrl.undoBall);
 router.post('/:id/over/end', requireScorerAuth, ctrl.endOver);
 router.post('/:id/corrections/players', requireScorerAuth, ctrl.correctPlayers);
@@ -22,6 +23,7 @@ router.post('/:id/corrections/target', requireScorerAuth, ctrl.reviseTarget);
 router.post('/:id/penalty', requireScorerAuth, ctrl.addPenalty);
 router.get('/:id/audit', requireScorerAuth, ctrl.auditLogs);
 router.get('/:id/export.csv', requireScorerAuth, ctrl.exportCsv);
+router.get('/:id/export.pdf', requireScorerAuth, ctrl.exportPdf);
 router.post('/:id/unlock', requireScorerAuth, ctrl.unlockMatch);
 router.post('/:id/innings/end', requireScorerAuth, ctrl.endInnings);
 router.post('/:id/end', requireScorerAuth, ctrl.endMatch);

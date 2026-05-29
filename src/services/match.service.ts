@@ -43,10 +43,15 @@ export async function createMatch(data: {
   return Match.create({ ...data, balls_per_over: data.balls_per_over || 6, share_token, status: 'pending' });
 }
 
-export async function verifyPin(matchId: number, pin: string) {
+export async function verifyPin(matchId: number, pin: string, force = false) {
   const match = await Match.findByPk(matchId);
   if (!match) throw new Error('Match not found');
   if (match.scorer_pin !== pin) throw new Error('Invalid PIN');
+
+  const activeSession = await MatchSession.findOne({ where: { match_id: matchId }, order: [['created_at', 'DESC']] });
+  if (activeSession && new Date() <= activeSession.expires_at && !force) {
+    throw new Error('Scorer already active on another device');
+  }
 
   // Revoke existing sessions in the DB AND in the in-memory auth cache,
   // so the old token can't keep working via the cache after the new

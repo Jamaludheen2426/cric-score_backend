@@ -487,6 +487,200 @@ export async function getAuditLogs(matchId: number) {
   });
 }
 
+function ballRunsTotal(ball: Ball) {
+  return Number(ball.runs || 0) + Number(ball.extras || 0);
+}
+
+function bowlerRunsForBall(ball: Ball) {
+  return ball.extra_type === 'bye' || ball.extra_type === 'leg_bye'
+    ? (ball.is_noball ? 1 : 0)
+    : ballRunsTotal(ball);
+}
+
+async function ensureBowlingCard(inningsId: number, playerId: number) {
+  const card = await BowlingCard.findOne({ where: { innings_id: inningsId, player_id: playerId } });
+  if (card) return card;
+  return BowlingCard.create({ innings_id: inningsId, player_id: playerId });
+}
+
+async function replayInnings(match: Match, innings: Innings) {
+  const perOver = ballsPerOver(match);
+  const overs = await Over.findAll({ where: { innings_id: innings.id }, order: [['over_number', 'ASC']] });
+  const balls = await Ball.findAll({
+    where: { over_id: overs.map(o => o.id) },
+    include: [{ model: Over, as: 'over' }],
+    order: [[{ model: Over, as: 'over' }, 'over_number', 'ASC'], ['ball_number', 'ASC']],
+  });
+  const battingCards = await BattingCard.findAll({ where: { innings_id: innings.id }, order: [['batting_position', 'ASC']] });
+  const battingByPlayer = new Map<number, BattingCard>();
+  for (const card of battingCards) {
+    battingByPlayer.set(card.player_id, card);
+    await card.update({ runs: 0, balls: 0, fours: 0, sixes: 0, is_out: false, dismissal_type: null, bowler_id: null } as any);
+  }
+  const bowlingCards = await BowlingCard.findAll({ where: { innings_id: innings.id } });
+  const bowlingByPlayer = new Map<number, BowlingCard>();
+  for (const card of bowlingCards) {
+    bowlingByPlayer.set(card.player_id, card);
+    await card.update({ overs: 0, runs: 0, wickets: 0, extras: 0, legal_balls: 0 });
+  }
+
+  let totalRuns = 0;
+  let totalWickets = 0;
+  let totalExtras = 0;
+  let totalLegal = 0;
+  let current1 = battingCards[0]?.player_id || innings.current_batsman1_id;
+  let current2 = battingCards[1]?.player_id || innings.current_batsman2_id;
+  let striker = current1 || innings.on_strike_batsman_id;
+  let nextCardIndex = 2;
+
+  const ballsByOver = new Map<number, Ball[]>();
+  for (const ball of balls) {
+    const arr = ballsByOver.get(ball.over_id) || [];
+    arr.push(ball);
+    ballsByOver.set(ball.over_id, arr);
+  }
+
+  for (const over of overs) {
+    let overRuns = 0;
+    let overWickets = 0;
+    let overExtras = 0;
+    let overLegal = 0;
+    const bowlerCard = bowlingByPlayer.get(over.bowler_player_id) || await ensureBowlingCard(innings.id, over.bowler_player_id);
+    bowlingByPlayer.set(over.bowler_player_id, bowlerCard);
+
+    for (const ball of ballsByOver.get(over.id) || []) {
+      const isLegal = !ball.is_wide && !ball.is_noball;
+      const runs = ballRunsTotal(ball);
+      const batterRuns = ball.is_wide || ball.extra_type === 'bye' || ball.extra_type === 'leg_bye' ? 0 : Number(ball.runs || 0);
+      const batterCard = battingByPlayer.get(ball.batsman_player_id);
+      const countsAsWicket = Boolean(ball.is_wicket);
+      overRuns += runs;
+      totalRuns += runs;
+      overExtras += Number(ball.extras || 0);
+      totalExtras += Number(ball.extras || 0);
+      if (isLegal) {
+        overLegal += 1;
+        totalLegal += 1;
+      }
+      if (countsAsWicket) {
+        overWickets += 1;
+        totalWickets += 1;
+      }
+
+      if (batterCard) {
+        const newRuns = batterCard.runs + batterRuns;
+        const newBalls = batterCard.balls + (isLegal ? 1 : 0);
+        const newFours = batterCard.fours + (batterRuns === 4 ? 1 : 0);
+        const newSixes = batterCard.sixes + (batterRuns === 6 ? 1 : 0);
+        await batterCard.update({
+          runs: newRuns,
+          balls: newBalls,
+          fours: newFours,
+          sixes: newSixes,
+        });
+        Object.assign(batterCard, {
+          runs: newRuns,
+          balls: newBalls,
+          fours: newFours,
+          sixes: newSixes,
+        });
+      }
+
+      const newBowlerLegalBalls = bowlerCard.legal_balls + (isLegal ? 1 : 0);
+      const newBowlerRuns = bowlerCard.runs + bowlerRunsForBall(ball);
+      const newBowlerWickets = bowlerCard.wickets + (countsAsWicket && ball.wicket_type !== 'run_out' ? 1 : 0);
+      const newBowlerExtras = bowlerCard.extras + Number(ball.extras || 0);
+      await bowlerCard.update({
+        runs: newBowlerRuns,
+        wickets: newBowlerWickets,
+        extras: newBowlerExtras,
+        legal_balls: newBowlerLegalBalls,
+        overs: ballsToOversFloat(newBowlerLegalBalls, perOver),
+      });
+      Object.assign(bowlerCard, {
+        runs: newBowlerRuns,
+        wickets: newBowlerWickets,
+        extras: newBowlerExtras,
+        legal_balls: newBowlerLegalBalls,
+      });
+
+      if (countsAsWicket) {
+        const dismissedId = ball.dismissed_player_id || ball.batsman_player_id;
+        const dismissedCard = battingByPlayer.get(dismissedId);
+        if (dismissedCard) {
+          await dismissedCard.update({
+            is_out: true,
+            dismissal_type: ball.wicket_type,
+            bowler_id: ball.wicket_type !== 'run_out' ? over.bowler_player_id : dismissedCard.bowler_id,
+          } as any);
+          dismissedCard.is_out = true;
+        }
+        const replacement = ball.new_batsman_id || battingCards[nextCardIndex]?.player_id;
+        if (replacement) {
+          if (dismissedId === current1) current1 = replacement;
+          if (dismissedId === current2) current2 = replacement;
+          nextCardIndex += ball.new_batsman_id ? 0 : 1;
+          striker = ball.next_striker_id && [current1, current2].includes(ball.next_striker_id)
+            ? ball.next_striker_id
+            : (dismissedId === striker ? replacement : striker);
+        }
+      } else if (isLegal && Number(ball.runs || 0) % 2 === 1) {
+        striker = striker === current1 ? current2 : current1;
+      }
+    }
+
+    await over.update({ runs: overRuns, wickets: overWickets, extras: overExtras, legal_balls: overLegal });
+    if (overLegal >= perOver) striker = striker === current1 ? current2 : current1;
+  }
+
+  const liveOver = overs.find(o => o.status === 'live') || overs[overs.length - 1];
+  await innings.update({
+    total_runs: totalRuns,
+    total_wickets: totalWickets,
+    extras: totalExtras,
+    total_overs_bowled: ballsToOversFloat(totalLegal, perOver),
+    current_batsman1_id: current1,
+    current_batsman2_id: current2,
+    on_strike_batsman_id: striker,
+    current_bowler_id: liveOver?.bowler_player_id || innings.current_bowler_id,
+  });
+}
+
+export async function editBall(matchId: number, ballId: number, input: Partial<BallInput>) {
+  const match = await Match.findByPk(matchId);
+  if (!match) throw new Error('Match not found');
+  if (match.status !== 'live') throw new Error('Only live matches can be edited');
+
+  const ball = await Ball.findByPk(ballId, { include: [{ model: Over, as: 'over' }] });
+  if (!ball || !(ball as any).over) throw new Error('Ball not found');
+  const over = (ball as any).over as Over;
+  const innings = await Innings.findByPk(over.innings_id);
+  if (!innings || innings.match_id !== matchId) throw new Error('Ball does not belong to this match');
+
+  const isWide = Boolean(input.is_wide);
+  const isNoBall = Boolean(input.is_noball);
+  const isByeLike = input.extra_type === 'bye' || input.extra_type === 'leg_bye';
+  const batRuns = isWide || isByeLike ? 0 : Number(input.runs ?? ball.runs ?? 0);
+  const extras = Number(input.extras ?? ball.extras ?? 0);
+  await ball.update({
+    runs: batRuns,
+    is_wide: isWide,
+    is_noball: isNoBall,
+    is_wicket: Boolean(input.is_wicket),
+    wicket_type: input.wicket_type as any,
+    dismissed_player_id: input.dismissed_player_id,
+    new_batsman_id: input.new_batsman_id,
+    next_striker_id: input.next_striker_id,
+    extra_type: isWide ? 'wide' : isNoBall ? 'no_ball' : input.extra_type,
+    extras,
+  } as any);
+
+  await replayInnings(match, innings);
+  broadcastInBackground(match.share_token);
+  audit(matchId, 'ball_edited', { ball_id: ballId, input });
+  return { edited: true };
+}
+
 export async function endInnings(matchId: number, data: {
   opening_batsman1_id: number;
   opening_batsman2_id: number;
@@ -506,7 +700,16 @@ export async function endInnings(matchId: number, data: {
     order: [['innings_number', 'DESC']],
   });
   if (!currentInnings) throw new Error('No innings found');
-  if (currentInnings.innings_number >= 2) {
+  const firstInnings = await Innings.findOne({ where: { match_id: matchId, innings_number: 1 } });
+  const secondInnings = await Innings.findOne({ where: { match_id: matchId, innings_number: 2 } });
+  const tiedAfterSecond = currentInnings.innings_number === 2
+    && firstInnings
+    && secondInnings
+    && firstInnings.total_runs === secondInnings.total_runs;
+  if (currentInnings.innings_number >= 4) {
+    throw new Error('Super over is complete; end the match instead');
+  }
+  if (currentInnings.innings_number >= 2 && !tiedAfterSecond && currentInnings.innings_number !== 3) {
     throw new Error('Second innings already exists; end the match instead');
   }
 
@@ -530,8 +733,9 @@ export async function endInnings(matchId: number, data: {
     await Over.update({ status: 'completed' }, { where: { innings_id: currentInnings.id, status: 'live' } });
   }
 
-  // Target = current innings runs + 1
-  const target = currentInnings.total_runs + 1;
+  // Normal chase and second super-over innings get a target. The first
+  // super-over innings starts without a target.
+  const target = currentInnings.innings_number === 2 ? undefined : currentInnings.total_runs + 1;
 
   // Swap batting/bowling teams
   const newInnings = await Innings.create({
