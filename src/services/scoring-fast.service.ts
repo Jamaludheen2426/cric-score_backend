@@ -97,6 +97,10 @@ export async function addBall(matchId: number, input: BallInput) {
         WHERE team_id = (SELECT batting_team_id FROM innings WHERE id = @innings_id);
       SELECT id, is_out FROM batting_cards
         WHERE innings_id = @innings_id AND player_id = ?;
+      SELECT id, is_out FROM batting_cards
+        WHERE innings_id = @innings_id AND player_id = ?;
+      SELECT id FROM players
+        WHERE team_id = (SELECT batting_team_id FROM innings WHERE id = @innings_id) AND id = ?;
       SELECT id, is_wide, is_noball, is_free_hit FROM balls
         WHERE over_id = @over_id ORDER BY ball_number DESC LIMIT 1;
     `;
@@ -104,6 +108,8 @@ export async function addBall(matchId: number, input: BallInput) {
       matchId,
       matchId,
       input.dismissed_player_id ?? 0,   // for the non-striker card lookup (matches nothing if 0)
+      input.new_batsman_id ?? 0,
+      input.new_batsman_id ?? 0,
     ]);
 
     // mysql2 returns an array of result sets in the same order as the statements.
@@ -119,6 +125,8 @@ export async function addBall(matchId: number, input: BallInput) {
       battingCardCountRows,
       playerCountRows,
       nonStrikerCardRows,
+      newBatsmanCardRows,
+      newBatsmanRows,
       lastBallRows,
     ] = sets;
 
@@ -131,6 +139,8 @@ export async function addBall(matchId: number, input: BallInput) {
     const battingCardCount    = battingCardCountRows?.[0]?.cnt ?? 0;
     const rosterCount         = playerCountRows?.[0]?.cnt ?? 0;
     const nonStrikerCard      = nonStrikerCardRows?.[0];
+    const newBatsmanCard      = newBatsmanCardRows?.[0];
+    const newBatsman          = newBatsmanRows?.[0];
     const lastBall            = lastBallRows?.[0];
 
     if (!match)   throw new Error('Match not found');
@@ -242,8 +252,16 @@ export async function addBall(matchId: number, input: BallInput) {
     let inningsBatsman1 = innings.current_batsman1_id;
     let inningsBatsman2 = innings.current_batsman2_id;
     let inningsOnStrike = newOnStrike;
+    let isReturningRetiredBatter = false;
     if ((countsAsWicket || retiredHurt) && input.new_batsman_id) {
-      if (battingCardCount >= maxBatters) {
+      if (!newBatsman) {
+        throw new Error('New batsman must belong to batting team');
+      }
+      isReturningRetiredBatter = Boolean(newBatsmanCard && !newBatsmanCard.is_out);
+      if (newBatsmanCard?.is_out) {
+        throw new Error('New batsman has already been dismissed');
+      }
+      if (!isReturningRetiredBatter && battingCardCount >= maxBatters) {
         throw new Error('No batting slots remain for a new batsman');
       }
       const dismissedId = input.dismissed_player_id || strikerId;
@@ -304,7 +322,7 @@ export async function addBall(matchId: number, input: BallInput) {
       writes.push(`UPDATE batting_cards SET is_out = TRUE, dismissal_type = 'run_out' WHERE id = ?`);
       params.push(nonStrikerCard.id);
     }
-    if ((countsAsWicket || retiredHurt) && input.new_batsman_id) {
+    if ((countsAsWicket || retiredHurt) && input.new_batsman_id && !isReturningRetiredBatter) {
       writes.push(`INSERT INTO batting_cards (innings_id, player_id, batting_position) VALUES (?, ?, ?)`);
       params.push(innings.id, input.new_batsman_id, battingCardCount + 1);
     }

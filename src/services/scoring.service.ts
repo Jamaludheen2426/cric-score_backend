@@ -238,24 +238,28 @@ export async function addBall(matchId: number, input: BallInput) {
 
   // Handle new batsman coming in
   if ((countsAsWicket || retiredHurt) && input.new_batsman_id) {
-    if (battingCardCount >= maxBatters) {
-      throw new Error('No batting slots remain for a new batsman');
-    }
-
     const newBatsman = await Player.findOne({ where: { id: input.new_batsman_id, team_id: innings.batting_team_id } });
     if (!newBatsman) throw new Error('New batsman must belong to batting team');
 
     const existingNewBatsmanCard = await BattingCard.findOne({ where: { innings_id: innings.id, player_id: input.new_batsman_id } });
-    if (existingNewBatsmanCard) throw new Error('New batsman has already batted in this innings');
+    const isReturningRetiredBatter = Boolean(existingNewBatsmanCard && !existingNewBatsmanCard.is_out);
+    if (existingNewBatsmanCard?.is_out) throw new Error('New batsman has already been dismissed');
+    if (!isReturningRetiredBatter && battingCardCount >= maxBatters) {
+      throw new Error('No batting slots remain for a new batsman');
+    }
 
     const dismissedId = input.dismissed_player_id || strikerId;
-    const existingBatCount = await BattingCard.count({ where: { innings_id: innings.id } });
+    const existingBatCount = isReturningRetiredBatter
+      ? battingCardCount
+      : await BattingCard.count({ where: { innings_id: innings.id } });
 
-    await BattingCard.create({
-      innings_id: innings.id,
-      player_id: input.new_batsman_id,
-      batting_position: existingBatCount + 1,
-    });
+    if (!isReturningRetiredBatter) {
+      await BattingCard.create({
+        innings_id: innings.id,
+        player_id: input.new_batsman_id,
+        batting_position: existingBatCount + 1,
+      });
+    }
 
     // Update innings current batsmen
     const isStriker = dismissedId === innings.current_batsman1_id;
